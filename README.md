@@ -6,9 +6,9 @@ Airtable holds 5,850 leads with a phone number on every one. Total dispositions
 ever logged: 11. The bottleneck was never the list or the talk track — it was the
 moment before pressing dial, and that moment is won by not calling.
 
-Set a target, hit Start once, and the machine dials down the list on its own —
-through the breather, into the next number, never handing him a moment where
-stopping is easier than continuing.
+Set a target, hit Start once, sit through a five-minute lock-in, and the machine
+dials down the list on its own — through the breather, into the next number,
+never handing him a moment where stopping is easier than continuing.
 
 ---
 
@@ -22,15 +22,51 @@ open -a "No Brakes"          # the installed app
 Dry run — real queue, simulated ring→outcome, zero Twilio spend, zero writes:
 
 ```bash
-DIALER_DRY_RUN=1 DIALER_ARM_WRITE=0 ./run.sh
-./.venv/bin/python3 packaging/dryrun_check.py   # 54-check verification harness
+DIALER_DRY_RUN=1 DIALER_ARM_WRITE=0 DIALER_WARMUP_SECONDS=2 ./run.sh
+./.venv/bin/python3 packaging/dryrun_check.py   # 67-check verification harness
 ```
+
+The harness sits through the warmup rather than bypassing it, so it needs the
+short one; it refuses to run against a warmup longer than 10s, and aborts
+outright if it finds the server armed.
 
 Install / reinstall the app bundle:
 
 ```bash
 bash packaging/install.sh
 ```
+
+## The warmup
+
+START does not dial. It drops into a **5:00 lock-in** and the first call goes out
+when that hits zero, on its own.
+
+**No key shortens it** — not even `ENTER`, which is "go now" in every other state.
+That is the point: `ENTER` is the key his hands already know, so a skip would get
+pressed reflexively on exactly the mornings the warmup exists for. The only way
+out is the same as everywhere else: hold `ESC` and type the sentence, which ends
+the session rather than the wait.
+
+It is not a screen that happens to count down. The deadline is an absolute
+timestamp in the session file and `/api/dial` returns `425` until it passes, so:
+
+- force-quitting through the warmup **does not skip it** — relaunching returns to
+  the time that is actually left *(verified: 60s → killed at 40s left → dead 15s →
+  relaunched at 24s)*
+- and **does not reset it** — the clock runs while the app is dead, so if it
+  expires during the force-quit, relaunching comes back ready to dial
+- a hand-rolled `POST /api/dial` gets the same refusal the window does
+
+Five minutes of a bare countdown is five minutes to talk yourself out of it, so
+the screen carries the **top three leads** — company, name, industry, attempt
+number, mystery-shop cue, and a CSLB owner-name lookup on the rows with no name.
+Read the list, then dial it warm. Cues only, never a script (`cold_calling_
+conversational`).
+
+Starting late enough that the warmup would push the first dial past 9:00pm is
+refused at START, because a timer with no stop must never run toward a wall.
+
+Length is `DIALER_WARMUP_SECONDS` (default 300). `0` disables it.
 
 ## Keys
 
@@ -42,7 +78,11 @@ bash packaging/install.sh
 | `D` | do-not-call — honored on the spot, no rebuttal |
 | `P` | pause. One per session, 10:00 ceiling, `ENTER` resumes early |
 
-**Keys that do not exist:** back, add-time, skip-lead, quit.
+**Keys that do not exist:** back, add-time, skip-lead, quit, skip-warmup.
+
+During the warmup **no key does anything at all**, including `P` — pausing the
+lock-in is pausing a pause, and a refused `P` does not burn the session's one
+real pause.
 
 A call that never connects auto-logs No Answer and advances with **zero keys**.
 
@@ -59,6 +99,8 @@ actually ends the session.**
    down to the next dial — no Start button, no fresh slate. An outcome parked
    mid-breather is committed on the next boot, so a force-quit loses nothing.
    *(Verified: 2 of 20 → `kill -9` → relaunched at 3 of 20, parked outcome written.)*
+   The same is true of the 5:00 warmup: its deadline is a timestamp, not a timer,
+   so quitting through it neither skips it nor restarts it.
 3. **Typing is the only graceful exit.** Hold `ESC` for 2s, then type
    `I am quitting at 8 of 20 with 12 calls left` verbatim. Paste is blocked.
 4. **Abandonment is recorded** to `state/abandons.jsonl` and shown on the start
@@ -309,6 +351,8 @@ behaviour.
 | Server/tab crash | `state/session-{date}.json` resumes mid-list; parked outcome committed on boot |
 | Runaway loop | hard cap of 60 dials per session (cost guard) |
 | Outside 8am–9pm | dialing refused (legal line) |
+| Warmup would end after 9pm | START refused — the lock-in never runs toward a wall |
+| Force-quit during the warmup | resumes into the time that is left; expired-while-dead comes back dialing |
 
 **Rule: no technical problem may ever produce a moment where stopping is easier
 than continuing.**
@@ -325,7 +369,7 @@ dialer/twilio_voice.py    token minting, child-call lookup, caller-ID guards (--
 static/                   index.html, dialer.js, dialer.css, manifest.json, vendor/
 twilio-function/dial.js   deployed once to Twilio Functions, Protected
 packaging/provision_twilio.py   idempotent Twilio setup
-packaging/dryrun_check.py       54-check verification harness
+packaging/dryrun_check.py       67-check verification harness
 packaging/install.sh            builds the icon, installs /Applications/No Brakes.app
 state/                    gitignored: session, pending writes, abandons, logs
 ```

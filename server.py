@@ -14,6 +14,10 @@ drops him back into the breather at "8 of 20" with no Start button and no fresh
 slate. Quitting is always possible - Cmd-Q, Force Quit and the power button always
 work, and any design claiming otherwise is a lie. The goal is only that quitting
 costs more than continuing, and that it never actually ends anything.
+
+The same applies to the WARMUP that START drops into: its deadline is an absolute
+timestamp in the session file, so the five minutes elapse whether or not the app
+is running. Quitting through the lock-in does not skip it and does not reset it.
 """
 from __future__ import annotations
 
@@ -59,6 +63,15 @@ TYPING_RESUME_AFTER = 10  # timer resumes this long after the last keystroke
 PAUSE_MAX_SECONDS = 600   # one per session, 10:00 ceiling
 QUEUE_PREFETCH = 80
 
+# The lock-in window between START and the first dial. Same no-stopping rules as
+# the rest of the session: no key shortens it, and the clock is wall-clock and
+# server-side, so force-quitting through it neither escapes it nor resets it.
+# Env-overridable because the dry-run harness cannot wait five minutes.
+WARMUP_SECONDS = max(0, int(os.environ.get("DIALER_WARMUP_SECONDS", "300")))
+# How many leads off the top of the queue the warmup screen shows him. Enough to
+# read the cues and look up a missing owner name; not so many it becomes browsing.
+WARMUP_PREP_LEADS = 3
+
 app = Flask(__name__, static_folder=None)
 
 _lock = threading.RLock()
@@ -96,6 +109,7 @@ def load_session() -> dict | None:
 
 
 def new_session(target: int, filters: dict, queue: list) -> dict:
+    now = time.time()
     return {
         "id": uuid.uuid4().hex[:12],
         "date": date.today().isoformat(),
@@ -108,8 +122,12 @@ def new_session(target: int, filters: dict, queue: list) -> dict:
         "connects": 0,
         "conversations": 0,
         "booked": 0,
-        "state": "BREATHER",     # never IDLE once started - there is no going back
-        "breather_until": time.time(),   # first dial fires immediately
+        # Never IDLE once started - there is no going back. WARMUP is the lock-in
+        # window; the first dial fires when it expires, on its own.
+        "state": "WARMUP" if WARMUP_SECONDS > 0 else "BREATHER",
+        "warmup_seconds": WARMUP_SECONDS,
+        "warmup_until": now + WARMUP_SECONDS,
+        "breather_until": now,           # first dial fires the moment warmup ends
         "breather_seconds": 0,
         "pause_used": False,
         "pause_until": None,
@@ -126,7 +144,9 @@ def new_session(target: int, filters: dict, queue: list) -> dict:
 
 
 def public_session() -> dict:
-    """What the browser is allowed to see. Includes only the current and next lead."""
+    """What the browser is allowed to see. Includes only the current and next lead,
+    except during the warmup, where the point is to arrive at the first dial having
+    already read the top of the list."""
     if _session is None:
         return {"active": False}
     s = _session
@@ -146,7 +166,10 @@ def public_session() -> dict:
         "booked": s["booked"],
         "lead": q[c] if c < len(q) else None,
         "next_lead": q[c + 1] if c + 1 < len(q) else None,
+        "warmup_leads": q[c:c + WARMUP_PREP_LEADS] if s["state"] == "WARMUP" else None,
         "queue_depth": len(q) - c,
+        "warmup_remaining": max(0.0, (s.get("warmup_until") or 0) - now),
+        "warmup_seconds": s.get("warmup_seconds", 0),
         "breather_remaining": max(0.0, (s["breather_until"] or 0) - now),
         "breather_seconds": s["breather_seconds"],
         "pause_used": s["pause_used"],
@@ -182,8 +205,18 @@ def last_abandon() -> dict | None:
 
 # --- guards ------------------------------------------------------------------
 
-def in_call_window() -> bool:
-    return CALL_WINDOW[0] <= datetime.now().hour < CALL_WINDOW[1]
+def warmup_remaining() -> float:
+    """Seconds left in the lock-in, 0 if it is over or was never running.
+    Wall-clock on purpose: time spent force-quit still counts down, so quitting
+    through the warmup neither escapes it nor restarts it. Caller holds the lock."""
+    if _session is None or _session["state"] != "WARMUP":
+        return 0.0
+    return max(0.0, (_session.get("warmup_until") or 0) - time.time())
+
+
+def in_call_window(ts: float | None = None) -> bool:
+    when = datetime.fromtimestamp(ts) if ts is not None else datetime.now()
+    return CALL_WINDOW[0] <= when.hour < CALL_WINDOW[1]
 
 
 def window_error() -> dict:
@@ -192,6 +225,19 @@ def window_error() -> dict:
         "detail": (f"It is {datetime.now().strftime('%-I:%M %p')}. Calls are only "
                    f"placed between {CALL_WINDOW[0]}:00 and {CALL_WINDOW[1]}:00 local. "
                    "This is a legal line, not a preference."),
+    }
+
+
+def warmup_window_error() -> dict:
+    """Starting late enough that the warmup would land the first dial outside the
+    window. Refused at START rather than at the first dial - the warmup has no
+    stop, so it must never run toward a wall."""
+    ends = datetime.fromtimestamp(time.time() + WARMUP_SECONDS)
+    return {
+        "error": "warmup_ends_outside_call_window",
+        "detail": (f"The {WARMUP_SECONDS // 60}-minute warmup would put the first "
+                   f"dial at {ends.strftime('%-I:%M %p')}, past the "
+                   f"{CALL_WINDOW[1]}:00 legal cutoff. Too late to start."),
     }
 
 
@@ -234,6 +280,7 @@ def config():
         "dispositions": outcomes.KEY_TO_DISPOSITION,
         "breather": {"dead_end": BREATHER_DEAD_END, "real": BREATHER_REAL,
                      "typing_resume_after": TYPING_RESUME_AFTER},
+        "warmup": WARMUP_SECONDS,
         "pause_max": PAUSE_MAX_SECONDS,
         "last_abandon": last_abandon(),
     })
@@ -279,6 +326,8 @@ def start_session():
             return jsonify(public_session())
         if not in_call_window():
             return jsonify(window_error()), 403
+        if not in_call_window(time.time() + WARMUP_SECONDS):
+            return jsonify(warmup_window_error()), 403
         target = max(1, min(int(body.get("target", 20)), MAX_DIALS_PER_SESSION))
         filters = {
             "industry": body.get("industry") or None,
@@ -295,6 +344,31 @@ def start_session():
         return jsonify(public_session())
 
 
+@app.post("/api/warmup/done")
+def warmup_done():
+    """The lock-in ran out. The window asks, the server decides.
+
+    There is no early-exit counterpart to this. ENTER shortens the breather and
+    the pause because going faster is always allowed, but the warmup is the one
+    timer whose whole job is to be sat through - a skip key would be pressed
+    reflexively on exactly the mornings it exists for.
+    """
+    with _lock:
+        if _session is None:
+            return jsonify({"error": "no session"}), 409
+        if _session["state"] != "WARMUP":
+            return jsonify(public_session())
+        left = warmup_remaining()
+        if left > 0:
+            return jsonify({"error": "warmup", "warmup_remaining": left,
+                            "session": public_session()}), 425
+        _session["state"] = "BREATHER"
+        _session["breather_seconds"] = 0
+        _session["breather_until"] = time.time()
+        save_session()
+        return jsonify(public_session())
+
+
 @app.post("/api/dial")
 def dial():
     """Called just before device.connect(). Re-checks DNC on the live row."""
@@ -303,6 +377,12 @@ def dial():
             return jsonify({"error": "no session"}), 409
         if not in_call_window():
             return jsonify(window_error()), 403
+        # The warmup is enforced here, not only by the countdown in the window.
+        # A hand-rolled POST must not be able to jump the lock-in either.
+        left = warmup_remaining()
+        if left > 0:
+            return jsonify({"error": "warmup", "warmup_remaining": left,
+                            "detail": f"{int(left)}s of warmup left"}), 425
         if _session["dials"] >= MAX_DIALS_PER_SESSION:
             return jsonify({"error": "session dial cap reached"}), 429
         lead = _session["queue"][_session["cursor"]]
@@ -532,6 +612,11 @@ def pause():
     with _lock:
         if _session is None:
             return jsonify({"error": "no session"}), 409
+        if _session["state"] == "WARMUP":
+            # Pausing the lock-in is pausing a pause, and it would burn the one
+            # real pause he gets for the calls themselves.
+            return jsonify({"ok": False,
+                            "message": "the warmup is already the break"}), 200
         if _session["state"] == "DIALING":
             # Nothing to pause on a live call. Take effect after the hangup.
             _session["pause_requested"] = True
@@ -671,6 +756,13 @@ def bootstrap() -> None:
         # Resume. No Start button, no fresh slate.
         if _session.get("pause_until") and _session["pause_until"] > time.time():
             _session["state"] = "PAUSED"
+        elif _session["state"] == "WARMUP":
+            # Wall-clock: the seconds spent force-quit already counted. If it ran
+            # out while the app was dead, come back straight into the dial.
+            if time.time() >= (_session.get("warmup_until") or 0):
+                _session["state"] = "BREATHER"
+                _session["breather_until"] = time.time()
+                _session["breather_seconds"] = 0
         elif _session["state"] in ("DIALING", "PAUSED"):
             # A call cannot survive a restart; drop into the breather.
             _session["state"] = "BREATHER"

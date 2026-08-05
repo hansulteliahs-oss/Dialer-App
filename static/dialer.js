@@ -1,13 +1,15 @@
 /* No Brakes - session state machine + Twilio Device client.
  *
- *   IDLE -> DIALING -> BREATHER -> (target reached?) -> TALLY
- *                         ^                |
- *                         +----------------+
+ *   IDLE -> WARMUP -> DIALING -> BREATHER -> (target reached?) -> TALLY
+ *                        ^                |
+ *                        +----------------+
  *
  * Keys that exist:        SPACE  ENTER  1-5  D  P
  * Keys that do not exist: back, add-time, skip-lead, quit
+ * Keys during WARMUP:     none. Held ESC still reaches the abandon panel.
  *
- * The session lives on the server. Closing this window does not end it.
+ * The session lives on the server. Closing this window does not end it, and the
+ * warmup deadline is the server's wall clock - not a timer in this window.
  */
 (() => {
 'use strict';
@@ -27,6 +29,9 @@ const S = {
   tickTimer: null,
   breatherEndsAt: null,
   breatherTotal: 15,
+  warmupEndsAt: null,
+  warmupTotal: 300,
+  warmupEnding: false,
   pauseEndsAt: null,
   audioUnlocked: false,
   busy: false,
@@ -67,7 +72,7 @@ function writeStatus(msg, kind = '') {
 // --- screens -----------------------------------------------------------------
 
 function show(name) {
-  for (const s of ['idle', 'live', 'paused', 'tally']) {
+  for (const s of ['idle', 'warmup', 'live', 'paused', 'tally']) {
     $('screen-' + s).hidden = (s !== name);
   }
 }
@@ -99,6 +104,7 @@ async function boot() {
   setInterval(() => {
     if (S.breatherEndsAt && Date.now() >= S.breatherEndsAt) commitAndDial();
     if (S.pauseEndsAt && Date.now() >= S.pauseEndsAt) resumePause();
+    if (S.warmupEndsAt && Date.now() >= S.warmupEndsAt) endWarmup();
   }, 1000);
   wireIdle();
   wireBreather();
@@ -290,6 +296,102 @@ async function endCall(reason) {
   S.dateTouched = false;
   startBreather();
   render();
+}
+
+// --- warmup ------------------------------------------------------------------
+
+/* The lock-in between START and the first dial. No key shortens it — the server
+   refuses /api/dial until its own clock says the window is over, so this screen
+   is a display of that fact, not the thing enforcing it.
+
+   Five minutes of a bare countdown is five minutes to talk yourself out of it, so
+   the screen carries the top of the queue: read the cues, look up the owner names
+   that are missing, and arrive at the first dial already warm. */
+function startWarmup() {
+  show('warmup');
+  S.warmupTotal = S.session.warmup_seconds || S.cfg.warmup || 300;
+  S.warmupEndsAt = Date.now() + (S.session.warmup_remaining || 0) * 1000;
+  S.warmupEnding = false;
+  $('warmup-target').textContent = S.session.target;
+  renderWarmupLeads();
+  tickWarmup();
+}
+
+function tickWarmup() {
+  if (!S.warmupEndsAt || !S.session || S.session.state !== 'WARMUP') return;
+  const left = (S.warmupEndsAt - Date.now()) / 1000;
+  const el = $('warmup-clock');
+  el.textContent = fmtClock(left);
+  el.classList.toggle('warn', left <= 30);
+  if (left <= 0) { endWarmup(); return; }
+  requestAnimationFrame(tickWarmup);
+}
+
+async function endWarmup() {
+  if (S.warmupEnding) return;
+  S.warmupEnding = true;
+  const r = await api('/api/warmup/done', {body: {}});
+  if (r.__httpError === 425) {
+    // This window's clock ran ahead of the server's. Re-sync and keep counting;
+    // the server is the authority on when the lock-in is over.
+    S.warmupEndsAt = Date.now() + ((r.session && r.session.warmup_remaining) || 1) * 1000;
+    S.warmupEnding = false;
+    tickWarmup();
+    return;
+  }
+  S.warmupEndsAt = null;
+  S.session = r.active ? r : S.session;
+  show('live');
+  render();
+  dialNext();
+}
+
+function renderWarmupLeads() {
+  const wrap = $('warmup-leads');
+  wrap.innerHTML = '';
+  for (const lead of (S.session.warmup_leads || [])) {
+    const card = document.createElement('div');
+    card.className = 'warm-card';
+
+    const head = document.createElement('div');
+    head.className = 'warm-head';
+    head.innerHTML = `<span class="warm-company"></span>`
+                   + `<span class="warm-tier">${lead.tier_label || ''}</span>`;
+    head.querySelector('.warm-company').textContent = lead.company || '—';
+
+    const meta = document.createElement('div');
+    meta.className = 'warm-meta';
+    meta.textContent = [
+      lead.first_name || 'no name on file',
+      lead.industry,
+      lead.phone_display || lead.phone,
+      `attempt ${(lead.attempts || 0) + 1} of 4`,
+    ].filter(Boolean).join('  ·  ');
+
+    card.append(head, meta);
+
+    const cueText = [lead.context_cue, lead.leak_signal && `leak: ${lead.leak_signal}`]
+      .filter(Boolean).join('\n');
+    if (cueText) {
+      const cue = document.createElement('div');
+      cue.className = 'warm-cue';
+      cue.textContent = cueText;
+      card.append(cue);
+    }
+
+    // Same rule as the breather card: CSLB only pays when the row has no name.
+    if (!lead.first_name && lead.company) {
+      const a = document.createElement('a');
+      a.className = 'cslb';
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.href = 'https://www.cslb.ca.gov/OnlineServices/CheckLicenseII/NameRequest.aspx'
+             + '?BusName=' + encodeURIComponent(lead.company);
+      a.textContent = "look up the owner's name on CSLB →";
+      card.append(a);
+    }
+    wrap.append(card);
+  }
 }
 
 // --- breather ----------------------------------------------------------------
@@ -530,6 +632,9 @@ function wireKeys() {
       if (S.session.state === 'PAUSED') {
         S.pauseEndsAt = Date.now() + S.session.pause_remaining * 1000;
         show('paused'); tickPause();
+      } else if (S.session.state === 'WARMUP') {
+        // Back into whatever is left of the lock-in, never a fresh five minutes.
+        startWarmup();
       } else if (S.session.state === 'TALLY') {
         showTally();
       } else {
@@ -554,6 +659,15 @@ function wireKeys() {
     if (!S.session || !S.session.active) return;
     const st = S.session.state;
     const typing = document.activeElement === $('note');
+
+    if (st === 'WARMUP') {
+      // No keys exist here. Not even ENTER — it is the "go now" key everywhere
+      // else, which is exactly why it would get pressed reflexively and quietly
+      // delete the one part of the session that is for getting his head right.
+      // Held ESC is handled above and still reaches the abandon panel.
+      if (e.key !== 'Escape') e.preventDefault();
+      return;
+    }
 
     if (st === 'PAUSED') {
       if (e.key === 'Enter') { e.preventDefault(); resumePause(); }
@@ -608,6 +722,7 @@ function wireIdle() {
       return;
     }
     S.session = r;
+    if (S.session.state === 'WARMUP') { startWarmup(); return; }
     show('live');
     render();
     dialNext();

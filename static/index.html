@@ -50,6 +50,27 @@
   </div>
 </section>
 
+<!-- WARMUP (lock-in; no keys, dials on its own) ---------------------------- -->
+<section id="screen-warmup" class="screen" hidden>
+  <div class="warmup-wrap">
+    <div class="warmup-left">
+      <div class="warmup-label">locking in</div>
+      <div id="warmup-clock" class="warmup-clock">5:00</div>
+      <p class="warmup-note">
+        Dialing starts on its own. <b id="warmup-target">20</b> calls.<br>
+        No key skips this. Read the top of the list.
+      </p>
+      <p class="warmup-fine">
+        Hold <b>ESC</b> to abandon &mdash; that ends the session, not the wait.
+      </p>
+    </div>
+    <div class="warmup-right">
+      <div class="next-label">first up</div>
+      <div id="warmup-leads" class="warmup-leads"></div>
+    </div>
+  </div>
+</section>
+
 <!-- LIVE (dialing + breather share the frame) ------------------------------ -->
 <section id="screen-live" class="screen" hidden>
   <header class="bar">
