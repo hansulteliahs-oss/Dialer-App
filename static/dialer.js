@@ -277,6 +277,72 @@ async function unlockAudio() {
   }
 }
 
+// --- local ringback ----------------------------------------------------------
+
+/* The carrier takes ~3s to return real ringback after the leg is placed, and
+   nothing on this end can shorten it - measured 2026-08-05 on a fully warm
+   dial. This fills that silence with a locally generated US ringback (440+480Hz
+   sine pair, 2s on / 4s off) the instant the dial commits, and gets out of the
+   way the moment real audio arrives (early media, or the bridge on accept).
+   Slightly quieter than carrier ringback so the handoff reads as the real
+   thing arriving, not a glitch.
+
+   Plays through the system default output, not the SDK's selected speaker -
+   the same headphones in every real session. Every entry point is wrapped:
+   a missing tone must never cost a dial. */
+const RINGBACK_GAIN = 0.12;
+const RB = {ctx: null, nodes: null};
+
+function startLocalRingback() {
+  if (S.cfg.dry_run) return;
+  try {
+    stopLocalRingback();
+    if (!RB.ctx) RB.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (RB.ctx.state === 'suspended') RB.ctx.resume();
+    const ctx = RB.ctx;
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    gain.connect(ctx.destination);
+    const oscs = [440, 480].map(hz => {
+      const o = ctx.createOscillator();
+      o.type = 'sine';
+      o.frequency.value = hz;
+      o.connect(gain);
+      o.start();
+      return o;
+    });
+    // First burst begins ~50ms out - the point is sound at zero, so the cadence
+    // starts on the ring, not the silence. Ten cycles outlast the 22s dial
+    // timeout with room to spare; stop() is what actually ends it.
+    const t0 = ctx.currentTime + 0.05;
+    for (let i = 0; i < 10; i++) {
+      const on = t0 + i * 6;
+      gain.gain.setValueAtTime(0, on);
+      gain.gain.linearRampToValueAtTime(RINGBACK_GAIN, on + 0.02);
+      gain.gain.setValueAtTime(RINGBACK_GAIN, on + 2);
+      gain.gain.linearRampToValueAtTime(0, on + 2.02);
+    }
+    RB.nodes = {gain, oscs};
+  } catch (e) {
+    clientLog('warn', 'local ringback failed to start', {message: e && e.message});
+  }
+}
+
+function stopLocalRingback() {
+  if (!RB.nodes) return;
+  try {
+    const {gain, oscs} = RB.nodes;
+    const now = RB.ctx.currentTime;
+    // 50ms fade instead of a hard cut - a click at the handoff would announce
+    // the seam the tone exists to hide.
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value, now);
+    gain.gain.linearRampToValueAtTime(0, now + 0.05);
+    oscs.forEach(o => { try { o.stop(now + 0.08); } catch (_) { /* already stopped */ } });
+  } catch (_) { /* teardown never throws */ }
+  RB.nodes = null;
+}
+
 // --- phase timing ------------------------------------------------------------
 
 /* One dial, one line. The server log's second-granularity timestamps are what
@@ -348,6 +414,10 @@ async function dialNext() {
     setDialState('ringing…', 'ringing');
     startCallTimer();
     timingMark('timer');
+    // Sound in his ear the moment the timer starts. The screen and the
+    // headphones said different things for ~6 measured seconds; now the label
+    // above is true the instant it renders.
+    startLocalRingback();
 
     if (S.cfg.dry_run) {
       simulateCall();
@@ -363,6 +433,9 @@ async function dialNext() {
   } catch (e) {
     console.error(e);
     clientLog('error', 'dial threw', {name: e.name, code: e.code, message: e.message});
+    // The tone must not ring for the 5s the teardown below waits - a dial that
+    // failed has nothing to sound like it is doing.
+    stopLocalRingback();
     // If a call is up, the attempt is the thing that was wrong - not the call.
     // Tearing down here is what hung up on a receptionist mid-sentence: the
     // teardown fires 5s later and disconnects whatever is on the line.
@@ -383,7 +456,9 @@ function wireCall(call) {
     S.parentSid = call.parameters.CallSid;
     clientLog('info', 'call accepted', {sid: S.parentSid});
     // Bridged means audio for certain, even when the carrier never sent early
-    // media - so this is the flush of last resort for the audible mark.
+    // media - so this is the flush of last resort for the audible mark, and
+    // the local tone must be gone before a human hears it.
+    stopLocalRingback();
     timingMark('accept');
     timingFlush('accept');
     api('/api/call-sid', {body: {call_sid: S.parentSid}});
@@ -395,7 +470,8 @@ function wireCall(call) {
   call.on('ringing', hasEarlyMedia => {
     clientLog('info', 'ringback', {hasEarlyMedia});
     timingMark(hasEarlyMedia ? 'audible' : 'ring_silent');
-    if (hasEarlyMedia) timingFlush('early-media');
+    // Real carrier ringback has arrived; the local tone hands off and is gone.
+    if (hasEarlyMedia) { stopLocalRingback(); timingFlush('early-media'); }
   });
   call.on('disconnect', () => { clientLog('info', 'call disconnect'); endCall('remote'); });
   call.on('cancel', () => { clientLog('info', 'call cancel'); endCall('remote'); });
@@ -451,6 +527,7 @@ async function endCall(reason) {
   // expiry. Cleared when the next dial goes out.
   if (S.ending) return;
   S.ending = true;
+  stopLocalRingback();
   // A dial that never reached audio still reports what it paid and where.
   timingFlush('end:' + reason);
   stopPolling();
