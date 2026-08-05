@@ -210,6 +210,17 @@ this is a live tradeoff rather than a bug. **Trigger to revisit:** if connect ra
 looks bad after ~200 dials, switch to a Twilio-owned SoCal number with A
 attestation. The dial layer is one module specifically so that is a config change.
 
+**Verified 2026-08-04 — number delivery works.** A live test call reached a second
+handset which resolved `+17608464537` against its address book and displayed the
+saved contact name. The number arrives intact.
+
+**Still open — spam labeling on cold numbers.** That test proves delivery and
+nothing more: iOS and Android suppress spam warnings entirely for known contacts,
+so the receiving device never ran the check. A cold prospect has no contact entry,
+sees the raw number, and may get a carrier "Spam" / "Scam Likely" label off
+B-attestation plus reputation heuristics. Only real dials to strangers can answer
+it — which is what the ~200-dial connect-rate trigger above is for.
+
 A2P 10DLC is **SMS-only** — no registration needed for outbound voice.
 
 ---
