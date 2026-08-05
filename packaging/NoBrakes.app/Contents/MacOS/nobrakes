@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# /Applications/No Brakes.app launcher.
+#
+# Starts the local Flask server, opens it in a dedicated Chrome kiosk window, and
+# tears the server down when the window closes. The window runs under the Chrome
+# process, so the Dock shows Chrome's icon while it is open - the .app carries the
+# real icon and is what gets launched. See README for the optional PWA install
+# that fixes the Dock icon too.
+set -uo pipefail
+
+PORT=8787
+URL="http://localhost:${PORT}"
+PROFILE="$HOME/Library/Application Support/NoBrakes/chrome"
+CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+# Resolve the repo: prefer a REPO file dropped in by install.sh, else assume the
+# bundle is still sitting inside the repo tree.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$HERE/../Resources/REPO" ]]; then
+  REPO="$(cat "$HERE/../Resources/REPO")"
+else
+  REPO="$(cd "$HERE/../../../.." && pwd)"
+fi
+
+alert() { osascript -e "display alert \"No Brakes\" message \"$1\" as critical" >/dev/null 2>&1; }
+
+if [[ ! -x "$REPO/.venv/bin/python3" ]]; then
+  alert "Cannot find the dialer at:
+$REPO
+
+Re-run packaging/install.sh from the repo."
+  exit 1
+fi
+
+# 1. Already running? Focus that window instead of double-starting the server.
+if curl -sf --max-time 2 "$URL/health" >/dev/null 2>&1; then
+  osascript -e 'tell application "Google Chrome" to activate' >/dev/null 2>&1
+  exit 0
+fi
+
+# 2. Start the server.
+mkdir -p "$REPO/state"
+cd "$REPO"
+"$REPO/.venv/bin/python3" "$REPO/server.py" >> "$REPO/state/server.log" 2>&1 &
+SERVER_PID=$!
+
+cleanup() {
+  # 5. No orphaned Python.
+  if kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill -TERM "$SERVER_PID" 2>/dev/null
+    for _ in $(seq 1 20); do
+      kill -0 "$SERVER_PID" 2>/dev/null || break
+      sleep 0.25
+    done
+    kill -9 "$SERVER_PID" 2>/dev/null
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# 3. Wait for readiness, alert natively if it never comes up.
+READY=0
+for _ in $(seq 1 40); do        # 40 x 0.25s = 10s
+  if curl -sf --max-time 2 "$URL/health" >/dev/null 2>&1; then READY=1; break; fi
+  kill -0 "$SERVER_PID" 2>/dev/null || break
+  sleep 0.25
+done
+
+if [[ "$READY" -ne 1 ]]; then
+  TAIL="$(tail -n 12 "$REPO/state/server.log" 2>/dev/null | tr '"' "'")"
+  alert "The dialer did not start.
+
+$TAIL"
+  exit 1
+fi
+
+# 4. Kiosk window on a dedicated profile, so the mic grant persists and there is
+#    no tab strip, no URL bar, and no close button. Verified 2026-08-04: the mic
+#    prompt appears on first launch and the grant survives relaunches.
+if [[ ! -x "$CHROME" ]]; then
+  # 6. No Chrome: fall back to the default browser and say so.
+  alert "Google Chrome was not found, so this opened in your default browser instead.
+
+Kiosk mode and the persistent mic grant need Chrome."
+  open "$URL"
+  # Nothing to block on, so hold until the server dies or the user quits.
+  wait "$SERVER_PID"
+  exit 0
+fi
+
+mkdir -p "$PROFILE"
+"$CHROME" \
+  --kiosk \
+  --app="$URL" \
+  --user-data-dir="$PROFILE" \
+  --no-first-run \
+  --no-default-browser-check \
+  --disable-background-mode \
+  >/dev/null 2>&1
+
+# 5. Chrome returned: the window is closed. cleanup() fires on EXIT.
+exit 0

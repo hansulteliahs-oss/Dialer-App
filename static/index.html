@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>No Brakes</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="stylesheet" href="/dialer.css">
+</head>
+<body>
+
+<!-- IDLE ------------------------------------------------------------------ -->
+<section id="screen-idle" class="screen">
+  <div class="idle-wrap">
+    <h1 class="wordmark">No <span>Brakes</span></h1>
+    <p class="tagline">Set a target. Hit start once. The machine does the rest.</p>
+
+    <div id="abandon-banner" class="abandon-banner" hidden></div>
+
+    <div class="controls">
+      <label class="ctl">
+        <span>calls</span>
+        <input id="target" type="number" min="1" max="60" value="20" inputmode="numeric">
+      </label>
+      <label class="ctl">
+        <span>industry</span>
+        <select id="industry">
+          <option value="">all trades</option>
+          <option>HVAC</option><option>Plumbing</option><option>Electrical</option>
+          <option>Roofing</option><option>Remodelers</option>
+        </select>
+      </label>
+      <label class="ctl">
+        <span>list</span>
+        <select id="lead-type">
+          <option value="">best order (shopped &rarr; hiring &rarr; today &rarr; queued)</option>
+          <option value="Mystery Shopped">shopped, never replied</option>
+          <option value="Hiring Signal">hiring signal</option>
+          <option value="Cold">cold</option>
+        </select>
+      </label>
+    </div>
+
+    <button id="start" class="start">START</button>
+    <p id="idle-status" class="idle-status"></p>
+    <p class="fineprint">
+      <b>SPACE</b> voicemail or dead end &middot; <b>ENTER</b> real conversation &middot;
+      <b>1</b>&ndash;<b>5</b> disposition &middot; <b>D</b> do-not-call &middot; <b>P</b> pause (one)
+    </p>
+  </div>
+</section>
+
+<!-- LIVE (dialing + breather share the frame) ------------------------------ -->
+<section id="screen-live" class="screen" hidden>
+  <header class="bar">
+    <div class="counter"><b id="count-done">0</b> of <span id="count-target">20</span></div>
+    <div id="tier-badge" class="tier"></div>
+    <div class="bar-right">
+      <span id="attempt-badge" class="attempt"></span>
+      <span id="call-timer" class="timer">0:00</span>
+    </div>
+  </header>
+
+  <div class="stage">
+    <div class="lead-main">
+      <div id="lead-company" class="company">&mdash;</div>
+      <div class="lead-meta">
+        <span id="lead-name" class="name"></span>
+        <span id="lead-industry" class="pill"></span>
+        <span id="lead-phone" class="phone"></span>
+      </div>
+      <div id="lead-cue" class="cue" hidden></div>
+      <div id="dial-state" class="dial-state"></div>
+    </div>
+
+    <!-- BREATHER --------------------------------------------------------- -->
+    <div id="breather" class="breather" hidden>
+      <div class="breather-left">
+        <div class="ring-wrap" id="ring-wrap-holder">
+          <svg class="ring" viewBox="0 0 120 120">
+            <circle class="ring-bg" cx="60" cy="60" r="52"></circle>
+            <circle id="ring-fg" class="ring-fg" cx="60" cy="60" r="52"></circle>
+          </svg>
+          <div id="ring-label" class="ring-label">15</div>
+        </div>
+        <div class="dispositions" id="dispositions"></div>
+        <label class="next-action" id="next-action-wrap" hidden>
+          <span>next touch</span>
+          <input id="next-action" type="date">
+        </label>
+        <textarea id="note" class="note" rows="3"
+                  placeholder="note (optional) &mdash; typing holds the timer"></textarea>
+        <div class="hint">
+          <b>ENTER</b> go now &middot; <b>1</b>&ndash;<b>5</b> change disposition &middot;
+          <b>D</b> do-not-call &middot; <b>P</b> pause
+        </div>
+      </div>
+
+      <aside class="next-card" id="next-card">
+        <div class="next-label">up next</div>
+        <div id="next-company" class="next-company"></div>
+        <div id="next-meta" class="next-meta"></div>
+        <div id="next-cue" class="next-cue"></div>
+        <a id="cslb-link" class="cslb" target="_blank" rel="noopener" hidden>
+          look up the owner's name on CSLB &rarr;
+        </a>
+      </aside>
+    </div>
+  </div>
+
+  <div id="write-status" class="write-status"></div>
+</section>
+
+<!-- PAUSED ---------------------------------------------------------------- -->
+<section id="screen-paused" class="screen" hidden>
+  <div class="paused-wrap">
+    <div class="paused-label">paused</div>
+    <div id="pause-clock" class="pause-clock">10:00</div>
+    <p class="paused-note">
+      Resumes and dials on its own. <b>ENTER</b> to go back now.<br>
+      One pause per session.
+    </p>
+  </div>
+</section>
+
+<!-- TALLY ----------------------------------------------------------------- -->
+<section id="screen-tally" class="screen" hidden>
+  <div class="tally-wrap">
+    <h2>Session done</h2>
+    <div class="tally-grid">
+      <div><b id="t-dials">0</b><span>dials</span></div>
+      <div><b id="t-connects">0</b><span>connects</span></div>
+      <div><b id="t-convos">0</b><span>conversations</span></div>
+      <div><b id="t-booked">0</b><span>booked</span></div>
+    </div>
+    <div class="tally-actions">
+      <button id="another" class="start">ANOTHER 10</button>
+      <button id="done" class="ghost">DONE</button>
+    </div>
+  </div>
+</section>
+
+<!-- ABANDON --------------------------------------------------------------- -->
+<div id="abandon-panel" class="overlay" hidden>
+  <div class="abandon-box">
+    <h3>Abandon this session</h3>
+    <p>Type this exactly:</p>
+    <div id="abandon-target" class="abandon-target"></div>
+    <input id="abandon-input" class="abandon-input" autocomplete="off"
+           autocorrect="off" spellcheck="false" placeholder="type it out">
+    <div class="abandon-actions">
+      <button id="abandon-cancel" class="ghost">keep going</button>
+      <button id="abandon-confirm" class="danger" disabled>abandon</button>
+    </div>
+    <p class="abandon-fine">Recorded. The start screen will say so until a full session completes.</p>
+  </div>
+</div>
+
+<!-- RESUME GATE (browser audio needs one gesture) -------------------------- -->
+<div id="resume-gate" class="overlay" hidden>
+  <div class="resume-box">
+    <div class="resume-count"><b id="resume-done">0</b> of <span id="resume-target">20</span></div>
+    <p>press any key to keep going</p>
+    <small>the browser needs one keypress before it can open the mic</small>
+  </div>
+</div>
+
+<div id="banner" class="banner" hidden></div>
+
+<script src="/vendor/twilio-voice.min.js"></script>
+<script src="/dialer.js"></script>
+</body>
+</html>

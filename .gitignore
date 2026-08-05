@@ -1,0 +1,17 @@
+# secrets - this repo holds credentials that can place billable calls
+.env
+.env.local
+
+# runtime state: session resume, pending Airtable writes, abandon log, server log
+state/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# chrome profile, if anyone ever puts one here
+chrome-profile/

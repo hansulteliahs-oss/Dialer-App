@@ -1,0 +1,334 @@
+# No Brakes
+
+A cold-call dialer that removes the click.
+
+Airtable holds 5,850 leads with a phone number on every one. Total dispositions
+ever logged: 11. The bottleneck was never the list or the talk track — it was the
+moment before pressing dial, and that moment is won by not calling.
+
+Set a target, hit Start once, and the machine dials down the list on its own —
+through the breather, into the next number, never handing him a moment where
+stopping is easier than continuing.
+
+---
+
+## Run it
+
+```bash
+open -a "No Brakes"          # the installed app
+./run.sh                     # dev server only, no kiosk window
+```
+
+Dry run — real queue, simulated ring→outcome, zero Twilio spend, zero writes:
+
+```bash
+DIALER_DRY_RUN=1 DIALER_ARM_WRITE=0 ./run.sh
+./.venv/bin/python3 packaging/dryrun_check.py   # 54-check verification harness
+```
+
+Install / reinstall the app bundle:
+
+```bash
+bash packaging/install.sh
+```
+
+## Keys
+
+| Key | What it does |
+|---|---|
+| `SPACE` | voicemail or dead end → log No Answer, 15s breather |
+| `ENTER` | real conversation → 2:00 breather; during a breather, go now |
+| `1`–`5` | set the disposition (live during *every* breather) |
+| `D` | do-not-call — honored on the spot, no rebuttal |
+| `P` | pause. One per session, 10:00 ceiling, `ENTER` resumes early |
+
+**Keys that do not exist:** back, add-time, skip-lead, quit.
+
+A call that never connects auto-logs No Answer and advances with **zero keys**.
+
+## No way out — what's real and what's theater
+
+Cmd-Q, Force Quit and the power button always work. Any design claiming otherwise
+is a lie, and a lock defeated in three seconds teaches you the lock is fake. The
+goal is only that **quitting costs more than continuing, and quitting never
+actually ends the session.**
+
+1. **Kiosk fullscreen.** No close button, no tabs, no URL bar.
+2. **The session lives on the server, not in the window.** Closing the window does
+   not end it. Relaunching drops you back into the breather at `8 of 20`, counting
+   down to the next dial — no Start button, no fresh slate. An outcome parked
+   mid-breather is committed on the next boot, so a force-quit loses nothing.
+   *(Verified: 2 of 20 → `kill -9` → relaunched at 3 of 20, parked outcome written.)*
+3. **Typing is the only graceful exit.** Hold `ESC` for 2s, then type
+   `I am quitting at 8 of 20 with 12 calls left` verbatim. Paste is blocked.
+4. **Abandonment is recorded** to `state/abandons.jsonl` and shown on the start
+   screen until a full session completes.
+
+## Two hard refusals, coded in
+
+1. **Never dial a row with `DNC = true`.** Enforced in the Airtable query *and*
+   re-checked immediately before `device.connect()` — the queue can go stale
+   between pull and dial. Mirrors `tools/sdr_write.py`'s absolute-refusal posture.
+2. **Never allow `858-356-4281` as caller ID.** That is the mystery-shop persona
+   Google Voice line, and `connections.md` says it must never be shared — half the
+   best part of this queue is people who were shopped with it. Rejected at startup
+   in `server.py`, again in `provision_twilio.py`, and again inside the Twilio
+   Function.
+
+## Not an autodialer, by design
+
+Post-*Facebook v. Duguid*, an ATDS requires a random or sequential number
+generator. Three constraints keep this outside that definition, and they are
+requirements rather than defaults:
+
+- **one call at a time, never predictive**
+- **no prerecorded or synthetic voice, ever**
+- **numbers only from the curated Airtable list, never generated**
+
+There is also a hard 8am–9pm local refusal. That outer bound is a legal line, not
+a preference, and it never speaks between 8 and 9.
+
+**No call recording in v1.** California is all-party consent (CIPA §632, §632.7),
+$5,000 per violation, no proof of harm required.
+
+---
+
+## Setup
+
+### 1. Twilio (~30 min, one time)
+
+1. **Fund the account.** Not optional — a trial account can only *call* verified
+   numbers and cannot use a verified number as the outbound caller ID. Funding is
+   what unlocks the whole design.
+2. **Verify the personal cell as an outgoing caller ID.** Prospects see the real
+   number; callbacks ring the pocket.
+3. **Buy a US local number** (~$1.15/mo). Possibly not required — outbound works
+   with a verified caller ID alone — but a TwiML App *is* required regardless, and
+   it is a cheap hedge plus the fallback if attestation hurts connect rate.
+4. **Create an API Key + Secret.**
+5. **Deploy the Function and TwiML App:**
+
+   ```bash
+   ./.venv/bin/python3 packaging/provision_twilio.py
+   ```
+
+   This is idempotent and sets Function visibility to **Protected** explicitly,
+   then verifies it came back Protected. Do not deploy with the Serverless
+   Toolkit: the Console defaults new Functions to Protected but the toolkit
+   defaults to **Public** unless the file is named `*.protected.js`, and Public
+   here means a stranger with the URL can place calls billed to this account.
+   The caller ID is stored as a Function **env var**, so changing it needs no
+   redeploy.
+
+Functions cost effectively $0 — 10,000 free invocations/month against ~20/day.
+Running cost at 20 dials/day ≈ **$7/mo**.
+
+### 2. `.env`
+
+Copy `.env.example` to `.env` and fill it in. `.env` is gitignored, `chmod 600`,
+and a pre-commit hook refuses any commit containing a live `AC`/`SK` Twilio SID or
+a `pat`/`key` Airtable token.
+
+| Var | Notes |
+|---|---|
+| `TWILIO_ACCOUNT_SID` | starts `AC`. **Not** the API key — an `SK` value here is refused at startup |
+| `TWILIO_API_KEY` | starts `SK` |
+| `TWILIO_API_SECRET` | |
+| `TWILIO_TWIML_APP_SID` | starts `AP`, printed by `provision_twilio.py` |
+| `TWILIO_CALLER_ID` | E.164. Must be verified on a **Full** account |
+| `AIRTABLE_API_KEY` | starts `pat` |
+| `DIALER_ARM_WRITE` | `1` to actually write. Matches `CAL_ARM_WRITE` / `SDR_ARM_WRITE` |
+| `DIALER_DRY_RUN` | `1` to simulate calls |
+
+### 3. Hardware
+
+A wired USB boom-mic headset (Logitech H390, ~$30). Both AirPods and the XM5s
+drop to a degraded mono codec the moment the mic goes live, so you sound thin on
+the exact call where sounding like a real person is the pitch. Not a blocker —
+AirPods are fine for session one.
+
+---
+
+## Architecture
+
+```
+browser ──device.connect({To})──> Twilio ──> its own hosted Function (Protected)
+                                                    │
+                                                    ▼
+                              <Dial callerId answerOnBridge timeout=22>
+                                                    │
+   local Flask <──poll calls.list(parent_call_sid)──┘
+```
+
+No tunnel, no ngrok, no inbound webhook, no URL that changes every launch. The
+Function is Twilio-hosted with a permanent URL; the local server polls the REST
+API for the child leg's `status` + `duration`. Polling at ~1s on a single active
+call is nowhere near Twilio's rate ceilings.
+
+`answerOnBridge="true"` means you hear real ringback and the child leg is not
+marked answered until the lead picks up — which is what makes "completed with
+nonzero duration" a trustworthy connect signal.
+
+Without AMD, `completed` + nonzero duration covers both human and machine, which
+is fine: **you are the classifier** (`SPACE` vs `ENTER`). AMD was rejected because
+it costs 1–3s of dead air on human pickup — the exact robocall tell. Auto-advance
+only fires on calls that genuinely never connected.
+
+### Implementation notes that each cost an hour to learn
+
+- SDK is **`@twilio/voice-sdk` v2.18.3**, vendored in `static/vendor/` and
+  sha512-verified against the npm registry. The older `twilio-client` is EOL since
+  Sept 2025 — `Connection` → `Call`, `Device.Status` → `Device.State`.
+- Read the CallSid as `call.parameters.CallSid` **inside the `accept` handler**,
+  not after `connect()` resolves.
+- Access tokens have **no default TTL** and max at 24h. Set it explicitly and
+  handle `tokenWillExpire` (fires 10s out) with `device.updateToken()`.
+- **Hangup must branch on current status:** `update(status='canceled')` while
+  queued/ringing, `update(status='completed')` while in-progress. The wrong one
+  for the state is a documented failure, so `hangup()` fetches first.
+- Bind `127.0.0.1`, but browse to **`localhost`**. There is a live dispute over
+  whether `127.0.0.1` always counts as a secure context for `getUserMedia`, while
+  `localhost` definitively does. Same destination, no ambiguity about the mic.
+
+### Kiosk + mic
+
+Verified 2026-08-04, because no Twilio, Chrome, or community source documents it:
+**`--kiosk --app` composes fine, `getUserMedia` works, and the grant persists**
+across relaunches with a dedicated `--user-data-dir`. Second launch reported
+`permission_state_before: "granted"` and resolved in 1.4s with no prompt.
+
+**Known limitation:** the window runs under the Chrome process, so the Dock shows
+Chrome's icon while it is open. `/Applications/No Brakes.app` carries the real
+icon and is what you launch. For a custom icon on the window itself, Chrome must
+"Install" the page as a PWA — `manifest.json` ships for that; it is optional.
+
+### Known tradeoff: STIR/SHAKEN attestation
+
+A personal cell as caller ID gets **B-level** attestation; only a Twilio-owned
+number can reach A. There is no way to lift it while keeping the real number, so
+this is a live tradeoff rather than a bug. **Trigger to revisit:** if connect rate
+looks bad after ~200 dials, switch to a Twilio-owned SoCal number with A
+attestation. The dial layer is one module specifically so that is a config change.
+
+A2P 10DLC is **SMS-only** — no registration needed for outbound voice.
+
+---
+
+## The Airtable contract
+
+Base `appEJYWOrT5NAbxOM`, table `tblURF0GnyhgKIzJj` (`Call List`).
+**Re-read the live schema before changing any of this** — Eliahs runs parallel
+Claude sessions and cached field lists go stale within minutes.
+
+### Queue ranking (defaults; the pickers narrow, they do not reorder)
+
+| # | Tier | Dialable rows |
+|---|---|---|
+| 1 | `Lead Type = Mystery Shopped` **and** `Shop Result = No Response` | 89 |
+| 2 | `Lead Type = Hiring Signal` | 28 |
+| 3 | remaining `Status = Call Today` | 10 |
+| 4 | `Status = Queued`, oldest `Date Added` first | 5,710 |
+
+Tier 1 is the 89 rows whose own quote form he submitted and who never replied —
+the strongest opener in the playbook. 72 carry a real first name.
+
+**Always excluded:** `DNC = true`; `Status = Done` (retired); `Last Call Date` =
+today; blank/unnormalizable phone; and a `Snoozed` row whose `Next Action` is
+still in the future — dialing a promise early is the mirror image of the
+callback-burial bug.
+
+### Written after every call
+
+`Disposition`, `Last Call Date`, `Attempts +1`, `Notes` (date-stamped append),
+`Status`, `Next Action`, `Next Action Note` — the same seven fields
+`scripts/cold_call_log.py` writes.
+
+Status derivation matches that script's `plan_followup()`: terminal → `Done` with
+`Next Action` cleared (must be `None`, **never `""`** — Airtable 422s on an empty
+string for a date column); future next-action → `Snoozed`; today → `Call Today`.
+
+### Retirement
+
+When `Attempts` reaches **4** and the latest `Disposition` is `No Answer`:
+`Status = Done`, `Next Action` cleared, and `[date] retired - no contact in 4
+attempts` appended. `Attempts` keeps its existing cumulative meaning — no new
+field.
+
+A row that ever reached a human is **never** closed by the cap. There is no
+"ever talked" field and the plan forbids adding one, so the durable signal is the
+Notes history: every promise-class outcome leaves a `[date] <Disposition> - ...`
+line behind, and `had_real_contact()` looks for it (plus the row's current
+Disposition as a shallower second signal). Rows last touched by the old CLI only
+carry that marker if a note was passed — a known gap in historical coverage, not
+in anything this dialer writes.
+
+`Not interested` and `Meeting Booked` already terminate immediately.
+
+### Deliberate divergence from the CLI
+
+`cold_call_log.py` exits 2 rather than log `Busy, Call Back` or `Conversation`
+without a date. **A dialer cannot refuse** — refusing means stalling, and stalling
+is a brake. So the dialer **pre-fills** (`+3d` callback, `+7d` conversation),
+editable during the breather. The promise still lands in `Next Action` where the
+follow-up queue reads it, preserving the 2026-08-01 fix.
+
+### Why the accountability stack still works
+
+`tools/tune_me_out_gate.py` (`count_today`) derives dials from
+`Last Call Date = today` and conversations from `Disposition`. Writing those two
+fields the same way keeps the soft gate, the call-nudge cron, and
+`pull_activity_scoreboard.py` working with **zero changes**.
+
+### Drift risk
+
+`cold_call_log.py` and `dialer/outcomes.py` now encode this contract
+independently. **The dialer is the primary writer; the CLI is the fallback.**
+The contract is documented in both repos. `outcomes.py --selftest` pins the
+behaviour.
+
+---
+
+## Failure modes — the machine never stops
+
+| Failure | Behavior |
+|---|---|
+| Airtable write fails | queued to `state/pending-writes.jsonl`, retried by a background thread, session continues |
+| Twilio dial errors | 5s pause, `Attempts` **not** incremented, advance |
+| Mic permission lost | loud banner, queue keeps advancing |
+| Server/tab crash | `state/session-{date}.json` resumes mid-list; parked outcome committed on boot |
+| Runaway loop | hard cap of 60 dials per session (cost guard) |
+| Outside 8am–9pm | dialing refused (legal line) |
+
+**Rule: no technical problem may ever produce a moment where stopping is easier
+than continuing.**
+
+---
+
+## Layout
+
+```
+server.py                 Flask app; owns the session
+dialer/airtable.py        queue pull, outcome PATCH, retry queue, DNC refusal
+dialer/outcomes.py        disposition -> fields, next-action, retirement  (--selftest)
+dialer/twilio_voice.py    token minting, child-call lookup, caller-ID guards (--selftest)
+static/                   index.html, dialer.js, dialer.css, manifest.json, vendor/
+twilio-function/dial.js   deployed once to Twilio Functions, Protected
+packaging/provision_twilio.py   idempotent Twilio setup
+packaging/dryrun_check.py       54-check verification harness
+packaging/install.sh            builds the icon, installs /Applications/No Brakes.app
+state/                    gitignored: session, pending writes, abandons, logs
+```
+
+Every module self-tests standalone:
+
+```bash
+./.venv/bin/python3 -m dialer.outcomes --selftest
+./.venv/bin/python3 -m dialer.airtable --selftest
+./.venv/bin/python3 -m dialer.twilio_voice --selftest
+```
+
+---
+
+Separate from the AIOS on purpose: no Claude, no hooks, no skill, no lockfile.
+The AIOS side carries a `connections.md` entry, `references/twilio-api.md`, and
+the decisions log.
