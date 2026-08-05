@@ -57,12 +57,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# 3. Wait for readiness, alert natively if it never comes up.
+# 3. Wait for readiness, alert natively if it never comes up. 0.1s steps: the
+#    poll granularity is pure added latency on top of however long the server
+#    actually takes, and with preflight parallelised that is now ~1 Twilio RTT.
 READY=0
-for _ in $(seq 1 40); do        # 40 x 0.25s = 10s
+for _ in $(seq 1 100); do       # 100 x 0.1s = 10s ceiling, same as before
   if curl -sf --max-time 2 "$URL/health" >/dev/null 2>&1; then READY=1; break; fi
   kill -0 "$SERVER_PID" 2>/dev/null || break
-  sleep 0.25
+  sleep 0.1
 done
 
 if [[ "$READY" -ne 1 ]]; then

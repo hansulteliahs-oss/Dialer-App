@@ -91,28 +91,51 @@ class TwilioVoice:
             )
 
     def preflight(self) -> dict:
-        """Live checks against the account. Called once at server startup."""
-        acct = self._client.api.accounts(self.account_sid).fetch()
+        """Live checks against the account. Called once at server startup.
+
+        Five REST round-trips, fetched concurrently: run serially they cost
+        5x one Twilio RTT before the port even opens, which is most of what the
+        launcher's readiness poll used to sit through. Every check still runs
+        and every refusal still fires - only the waiting overlaps. Each worker
+        gets its own Client because the underlying requests.Session is not
+        promised thread-safe.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fresh():
+            return Client(self.api_key, self.api_secret, self.account_sid)
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            f_acct = pool.submit(lambda: fresh().api.accounts(self.account_sid).fetch())
+            f_verified = pool.submit(lambda: [c.phone_number
+                                              for c in fresh().outgoing_caller_ids.list()])
+            f_owned = pool.submit(lambda: [n.phone_number
+                                           for n in fresh().incoming_phone_numbers.list()])
+            f_app = pool.submit(lambda: fresh().applications(self.twiml_app_sid).fetch())
+            f_balance = pool.submit(lambda: fresh().balance.fetch().balance)
+            acct = f_acct.result()
+            verified = f_verified.result()
+            owned = f_owned.result()
+            app = f_app.result()
+            balance = f_balance.result()
+
         if acct.type != "Full":
             raise TwilioConfigError(
                 f"Twilio account type is {acct.type!r}, not 'Full'. A trial account "
                 "can only dial pre-verified numbers and cannot use a verified number "
                 "as caller ID. Upgrade before dialing."
             )
-        verified = [c.phone_number for c in self._client.outgoing_caller_ids.list()]
-        owned = [n.phone_number for n in self._client.incoming_phone_numbers.list()]
         if self.caller_id not in verified and self.caller_id not in owned:
             raise TwilioConfigError(
                 f"caller ID {self.caller_id} is neither verified {verified} nor owned "
                 f"{owned}. Verify it in the Twilio Console first."
             )
-        app = self._client.applications(self.twiml_app_sid).fetch()
         return {
             "account_type": acct.type,
             "caller_id": self.caller_id,
             "twiml_app": app.friendly_name,
             "voice_url": app.voice_url,
-            "balance": self._client.balance.fetch().balance,
+            "balance": balance,
         }
 
     # --- tokens --------------------------------------------------------------
