@@ -433,6 +433,7 @@ def dial():
 
     # Hard refusal #1, second half: the queue filter can go stale between pull and
     # dial. He runs parallel Claude sessions and the SDR agent writes these rows.
+    t0 = time.monotonic()
     try:
         phone = _air.assert_dialable(lead["id"])
     except Exception as e:  # noqa: BLE001
@@ -442,6 +443,7 @@ def dial():
             save_session()
         return jsonify({"error": str(e), "skipped": True,
                         "session": public_session()}), 200
+    dnc_ms = int((time.monotonic() - t0) * 1000)
 
     with _lock:
         _session["state"] = "DIALING"
@@ -450,7 +452,12 @@ def dial():
             "lead_id": lead["id"], "phone": phone,
             "started_at": time.time(), "parent_sid": None,
         }
+        t1 = time.monotonic()
         save_session()
+        # The two serial costs standing between "go" and the browser holding a
+        # phone number. Everything after this line is Twilio's side of the gap.
+        print(f"{datetime.now():%H:%M:%S} [dial] dnc_check={dnc_ms}ms "
+              f"save_session={int((time.monotonic() - t1) * 1000)}ms", flush=True)
         return jsonify({"phone": phone, "lead": lead, "session": public_session()})
 
 
@@ -781,9 +788,11 @@ def bootstrap() -> None:
             _twilio = None
     else:
         _twilio = TwilioVoice()   # raises on the persona line, before anything starts
+        t0 = time.monotonic()
         info = _twilio.preflight()
         print(f"twilio ok: {info['account_type']} account, caller id {info['caller_id']}, "
-              f"balance ${info['balance']}")
+              f"balance ${info['balance']} "
+              f"(preflight {int((time.monotonic() - t0) * 1000)}ms)")
 
     _session = load_session()
     if _session:

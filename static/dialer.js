@@ -174,7 +174,11 @@ async function boot() {
 
 async function initDevice() {
   if (S.device || S.cfg.dry_run) return;
+  // Timed locally, not via the dial marks: this function is meant to run during
+  // the warmup once pre-registration lands, and its cost matters wherever it is.
+  const t0 = performance.now();
   const t = await api('/api/token');
+  const tokenMs = Math.round(performance.now() - t0);
   if (t.error) { banner('Twilio token failed: ' + t.error); throw new Error(t.error); }
 
   S.device = new Twilio.Device(t.token, {
@@ -205,6 +209,7 @@ async function initDevice() {
     const a = S.device.audio;
     const labels = c => [...(c?.values?.() || c || [])].map(d => d.label || d.deviceId);
     clientLog('info', 'device registered', {
+      tokenMs, registerMs: Math.round(performance.now() - t0) - tokenMs,
       inputs: labels(a?.availableInputDevices),
       outputs: labels(a?.availableOutputDevices),
       speaker: labels(a?.speakerDevices?.get()),
@@ -229,6 +234,34 @@ async function unlockAudio() {
   }
 }
 
+// --- phase timing ------------------------------------------------------------
+
+/* One dial, one line. The server log's second-granularity timestamps are what
+   forced the 8s-vs-4s breakdown to be reconstructed by hand; these marks make
+   the go→audible spread readable off a single 'dial timing' entry. Milliseconds
+   from the moment dialNext() commits to a dial. Flushed at the first audible
+   moment (early media, or accept when the carrier sent none), and at call end
+   as the fallback so a failed dial still reports what it paid. */
+const T = {marks: null, flushed: false};
+
+function timingStart() {
+  T.marks = {t0: performance.now()};
+  T.flushed = false;
+}
+
+function timingMark(name) {
+  if (T.marks && T.marks[name] === undefined) {
+    T.marks[name] = Math.round(performance.now() - T.marks.t0);
+  }
+}
+
+function timingFlush(trigger) {
+  if (!T.marks || T.flushed) return;
+  T.flushed = true;
+  const {t0, ...phases} = T.marks;
+  clientLog('info', 'dial timing', {trigger, ...phases});
+}
+
 // --- the loop ----------------------------------------------------------------
 
 async function dialNext() {
@@ -245,9 +278,11 @@ async function dialNext() {
   // leaves the latch shut from the previous call and the loop never breathes
   // again. The guard above already proved no call is live.
   S.ending = false;
+  timingStart();
   try {
     stopBreather();
     const r = await api('/api/dial', {body: {}});
+    timingMark('api_dial');
     if (r.error && !r.skipped) {
       banner(r.error);
       // A refusal is not a stop. Wait a beat and take the next number.
@@ -269,13 +304,17 @@ async function dialNext() {
     render();
     setDialState('ringing…', 'ringing');
     startCallTimer();
+    timingMark('timer');
 
     if (S.cfg.dry_run) {
       simulateCall();
     } else {
       await initDevice();
+      timingMark('device');
       await unlockAudio();
+      timingMark('audio');
       S.call = await S.device.connect({params: {To: r.phone}});
+      timingMark('connect');
       wireCall(S.call);
     }
   } catch (e) {
@@ -300,13 +339,21 @@ function wireCall(call) {
     // resolves. answerOnBridge means this fires when the leg is bridged.
     S.parentSid = call.parameters.CallSid;
     clientLog('info', 'call accepted', {sid: S.parentSid});
+    // Bridged means audio for certain, even when the carrier never sent early
+    // media - so this is the flush of last resort for the audible mark.
+    timingMark('accept');
+    timingFlush('accept');
     api('/api/call-sid', {body: {call_sid: S.parentSid}});
     startPolling();
   });
   // The one event that proves media reached this end. answerOnBridge sends real
   // ringback down the same path as speech, so no 'ringing' line means he heard
   // silence - which is a media failure, not a lead who did not pick up.
-  call.on('ringing', hasEarlyMedia => clientLog('info', 'ringback', {hasEarlyMedia}));
+  call.on('ringing', hasEarlyMedia => {
+    clientLog('info', 'ringback', {hasEarlyMedia});
+    timingMark(hasEarlyMedia ? 'audible' : 'ring_silent');
+    if (hasEarlyMedia) timingFlush('early-media');
+  });
   call.on('disconnect', () => { clientLog('info', 'call disconnect'); endCall('remote'); });
   call.on('cancel', () => { clientLog('info', 'call cancel'); endCall('remote'); });
   call.on('error', e => {
@@ -361,6 +408,8 @@ async function endCall(reason) {
   // expiry. Cleared when the next dial goes out.
   if (S.ending) return;
   S.ending = true;
+  // A dial that never reached audio still reports what it paid and where.
+  timingFlush('end:' + reason);
   stopPolling();
   stopCallTimer();
   const connectedSecs = S.connectedAt ? (Date.now() - S.connectedAt) / 1000 : 0;
