@@ -5,11 +5,14 @@ Dry-run verification harness - plan verification step 1.
 Drives the running server through every branch of the state machine with zero
 Twilio spend and zero Airtable writes. Start the server first:
 
-    DIALER_DRY_RUN=1 DIALER_ARM_WRITE=0 ./run.sh
+    DIALER_DRY_RUN=1 DIALER_ARM_WRITE=0 DIALER_WARMUP_SECONDS=2 ./run.sh
 
 then:
 
     ./.venv/bin/python3 packaging/dryrun_check.py
+
+The short warmup is required, not a convenience: the harness waits the lock-in
+out rather than bypassing it, because there is no bypass to test against.
 """
 from __future__ import annotations
 
@@ -80,18 +83,38 @@ def one_call(disposition="No Answer", connected=False, breather=15):
     return call("POST", "/api/outcome", {})[0]
 
 
+MAX_TEST_WARMUP = 10   # the harness waits it out, so it has to be short
+
+
 def main():
     print("=== 0. server is up, dry run, not armed ===")
     h, _ = call("GET", "/health")
     check("dry_run", h.get("dry_run"), True)
     check("armed", h.get("armed"), False)
+    if not h.get("dry_run") or h.get("armed"):
+        # Every block below this dials. Against an armed live server that is real
+        # money and real prospects, so this aborts rather than reporting a fail
+        # and carrying on into the queue.
+        print("\nABORT: this harness dials. The server on 8787 is live "
+              f"(dry_run={h.get('dry_run')}, armed={h.get('armed')}). "
+              "Stop it and restart with DIALER_DRY_RUN=1 DIALER_ARM_WRITE=0.\n")
+        return 2
+
+    cfg0, _ = call("GET", "/api/config")
+    warmup = cfg0.get("warmup")
+    truthy("config exposes the warmup length", isinstance(warmup, int))
+    if not isinstance(warmup, int) or warmup > MAX_TEST_WARMUP:
+        print(f"\nwarmup is {warmup}s. This harness sits through the real lock-in "
+              f"rather than bypassing it, so restart the server with:\n\n"
+              f"    DIALER_DRY_RUN=1 DIALER_ARM_WRITE=0 DIALER_WARMUP_SECONDS=2 ./run.sh\n")
+        return 2
     reset()
 
     print("\n=== 1. session starts, queue is ranked, no fresh slate on restart ===")
     s, code = call("POST", "/api/session", {"target": 3})
     check("session created", code, 200)
     check("target", s.get("target"), 3)
-    check("starts in BREATHER, not IDLE", s.get("state"), "BREATHER")
+    check("starts in WARMUP, not IDLE and not dialing", s.get("state"), "WARMUP")
     truthy("lead present", s.get("lead"))
     truthy("next lead present for the breather card", s.get("next_lead"))
     check("tier 1 is shopped-never-replied", s["lead"]["tier"], "mystery_no_reply")
@@ -100,6 +123,28 @@ def main():
     again, _ = call("POST", "/api/session", {"target": 99})
     check("second START never resets the session", again.get("target"), 3)
     check("second START keeps the same lead", again["lead"]["company"], first_company)
+    truthy("second START does not restart the warmup clock",
+           again.get("warmup_remaining", 0) <= s.get("warmup_remaining", 0))
+
+    print("\n=== 1b. the warmup is a real gate, not a screen ===")
+    truthy("warmup counting down", 0 < s.get("warmup_remaining", 0) <= warmup)
+    truthy("warmup screen gets the top of the queue", s.get("warmup_leads"))
+    check("prep list is capped", len(s.get("warmup_leads") or []) <= 3, True)
+    d, code = call("POST", "/api/dial", {})
+    check("dial refused during the warmup", code, 425)
+    check("refusal names the warmup", d.get("error"), "warmup")
+    early, code = call("POST", "/api/warmup/done", {})
+    check("warmup cannot be ended early", code, 425)
+    p, _ = call("POST", "/api/pause", {})
+    check("pause refused during the warmup", p.get("ok"), False)
+    st, _ = call("GET", "/api/session")
+    check("a refused pause is not consumed", st.get("pause_used"), False)
+
+    time.sleep(s["warmup_remaining"] + 0.4)
+    w, code = call("POST", "/api/warmup/done", {})
+    check("warmup ends on its own clock", code, 200)
+    check("warmup hands off to the breather", w.get("state"), "BREATHER")
+    check("prep list is warmup-only", w.get("warmup_leads"), None)
 
     print("\n=== 2. attempt counter is load-bearing (playbook: no VM on 1-2) ===")
     truthy("attempts is an int", isinstance(s["lead"]["attempts"], int))
@@ -245,4 +290,17 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # This harness abandons sessions on purpose (block 10). Those abandons are
+    # not real, and the START screen banners the most recent one until a full
+    # session completes - so leaving them behind puts a lie on the one surface
+    # whose whole job is to tell the truth about quitting.
+    _ab = ROOT / "state" / "abandons.jsonl"
+    _before = _ab.read_bytes() if _ab.exists() else None
+    try:
+        _code = main()
+    finally:
+        if _before is None:
+            _ab.unlink(missing_ok=True)
+        else:
+            _ab.write_bytes(_before)
+    sys.exit(_code)
