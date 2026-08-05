@@ -98,6 +98,7 @@ async function boot() {
   }
 
   buildDispositionRow();
+  buildPilePicker();
   wireKeys();
   // requestAnimationFrame throttles hard if the window ever loses foreground.
   // The countdown must fire regardless — a stalled timer is a brake.
@@ -477,6 +478,29 @@ function buildDispositionRow() {
   row.appendChild(d);
 }
 
+/* Built from the server, which owns the pile definitions. Never hard-code the
+   options here — that is how the picker and the queue drift apart. */
+function buildPilePicker() {
+  const sel = $('pile');
+  sel.innerHTML = '';
+  for (const p of (S.cfg.piles || [])) {
+    const o = document.createElement('option');
+    o.value = p.value;
+    o.textContent = p.label;
+    o.selected = p.value === S.cfg.default_pile;
+    sel.appendChild(o);
+  }
+  // Spell out the actual tier chain. The option label has to stay short enough
+  // not to truncate, and "which list am I about to call" is worth being explicit
+  // about before committing to 20 of them with no way to stop.
+  const hint = () => {
+    const p = (S.cfg.piles || []).find(x => x.value === sel.value);
+    $('pile-hint').textContent = p ? p.tiers.join('  →  ') : '';
+  };
+  sel.addEventListener('change', hint);
+  hint();
+}
+
 async function setDisposition(label) {
   if (!S.session || !S.session.pending_outcome) return;
   const r = await api('/api/breather/update', {body: {disposition: label}});
@@ -714,7 +738,7 @@ function wireIdle() {
     const r = await api('/api/session', {body: {
       target: parseInt($('target').value, 10) || 20,
       industry: $('industry').value || null,
-      lead_type: $('lead-type').value || null,
+      pile: $('pile').value || null,
     }});
     if (r.error) {
       $('idle-status').textContent = r.error;

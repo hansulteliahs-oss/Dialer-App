@@ -117,7 +117,16 @@ def main():
     check("starts in WARMUP, not IDLE and not dialing", s.get("state"), "WARMUP")
     truthy("lead present", s.get("lead"))
     truthy("next lead present for the breather card", s.get("next_lead"))
-    check("tier 1 is shopped-never-replied", s["lead"]["tier"], "mystery_no_reply")
+    # Not pinned to a tier name: whether a callback is due today depends on the
+    # live table, so the invariant is the ordering, not the winner.
+    from dialer.airtable import PILES, TIERS  # noqa: E402
+    rank = [t for t, _ in TIERS]
+    qq, _ = call("GET", "/api/queue?limit=25&pile=priority")
+    ranks = [rank.index(l["tier"]) for l in qq["leads"]]
+    check("the queue never puts a colder tier ahead of a hotter one",
+          ranks, sorted(ranks))
+    check("the session's first lead is the hottest tier that has rows",
+          s["lead"]["tier"], qq["leads"][0]["tier"])
     first_company = s["lead"]["company"]
 
     again, _ = call("POST", "/api/session", {"target": 99})
@@ -145,6 +154,35 @@ def main():
     check("warmup ends on its own clock", code, 200)
     check("warmup hands off to the breather", w.get("state"), "BREATHER")
     check("prep list is warmup-only", w.get("warmup_leads"), None)
+
+    print("\n=== 1c. the two piles, and the callback that used to get buried ===")
+    truthy("config exposes the piles", cfg0.get("piles"))
+    check("two of them", len(cfg0.get("piles") or []), 2)
+    check("priority is the default", cfg0.get("default_pile"), "priority")
+
+    check("callback_due outranks every other tier", rank[0], "callback_due")
+    for name, tiers in PILES.items():
+        check(f"pile {name!r} can always reach a due callback",
+              "callback_due" in tiers, True)
+    check("cold pile does not include the warm tiers",
+          set(PILES["cold"]) & {"mystery_no_reply", "hiring_signal", "call_today"},
+          set())
+    check("priority falls through to cold rather than dead-ending",
+          PILES["priority"][-1], "queued")
+
+    # THE REGRESSION THIS EXISTS FOR. Every non-terminal disposition writes
+    # Status=Snoozed with a future Next Action, and nothing flips it back when
+    # the date lands. Before callback_due, a dialed cold row matched no tier on
+    # its callback date and was never dialed again - one attempt each, forever.
+    from dialer import outcomes as _o  # noqa: E402
+    cold_row = {"fields": {"Attempts": 1, "Lead Type": "Cold",
+                           "Status": "Queued", "Notes": ""}}
+    after = _o.build_payload(cold_row, "No Answer")
+    check("a dialed cold row leaves the Status tiers", after["Status"], "Snoozed")
+    truthy("...carrying a callback date", after.get("Next Action"))
+    check("...and only the date-keyed tier can find it again",
+          [t for t, c in TIERS if "Next Action" in c and "Status" not in c],
+          ["callback_due"])
 
     print("\n=== 2. attempt counter is load-bearing (playbook: no VM on 1-2) ===")
     truthy("attempts is an int", isinstance(s["lead"]["attempts"], int))

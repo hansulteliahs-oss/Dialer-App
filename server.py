@@ -43,7 +43,7 @@ from dialer import load_env                       # noqa: E402
 load_env(ROOT / ".env")
 
 from dialer import outcomes                      # noqa: E402
-from dialer.airtable import AirtableClient        # noqa: E402
+from dialer.airtable import DEFAULT_PILE, PILES, TIER_LABELS, AirtableClient  # noqa: E402
 from dialer.twilio_voice import TwilioConfigError, TwilioVoice  # noqa: E402
 
 PORT = int(os.environ.get("DIALER_PORT", "8787"))
@@ -281,6 +281,16 @@ def config():
         "breather": {"dead_end": BREATHER_DEAD_END, "real": BREATHER_REAL,
                      "typing_resume_after": TYPING_RESUME_AFTER},
         "warmup": WARMUP_SECONDS,
+        # The picker is built from this, never hard-coded in the window - same
+        # rule as the disposition keys. Two piles: work the warm rows, or grind
+        # the cold list. Both reach a due callback.
+        "piles": [
+            {"value": "priority", "label": "priority — callbacks, shopped, hiring",
+             "tiers": [TIER_LABELS[t] for t in PILES["priority"]]},
+            {"value": "cold", "label": "cold pile — never dialed",
+             "tiers": [TIER_LABELS[t] for t in PILES["cold"]]},
+        ],
+        "default_pile": DEFAULT_PILE,
         "pause_max": PAUSE_MAX_SECONDS,
         "last_abandon": last_abandon(),
     })
@@ -302,9 +312,9 @@ def token():
 def queue():
     limit = min(int(request.args.get("limit", 25)), 200)
     industry = request.args.get("industry") or None
-    lead_type = request.args.get("lead_type") or None
+    pile = request.args.get("pile") or None
     try:
-        return jsonify({"leads": _air.fetch_queue(limit, industry, lead_type)})
+        return jsonify({"leads": _air.fetch_queue(limit, industry, pile)})
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 502
 
@@ -331,10 +341,10 @@ def start_session():
         target = max(1, min(int(body.get("target", 20)), MAX_DIALS_PER_SESSION))
         filters = {
             "industry": body.get("industry") or None,
-            "lead_type": body.get("lead_type") or None,
+            "pile": body.get("pile") or DEFAULT_PILE,
         }
         try:
-            q = _air.fetch_queue(QUEUE_PREFETCH, filters["industry"], filters["lead_type"])
+            q = _air.fetch_queue(QUEUE_PREFETCH, filters["industry"], filters["pile"])
         except Exception as e:  # noqa: BLE001
             return jsonify({"error": f"could not build the queue: {e}"}), 502
         if not q:
@@ -566,8 +576,8 @@ def _advance(breather_seconds: int = BREATHER_DEAD_END, skip: bool = False) -> N
         return
     if s["cursor"] >= len(s["queue"]):
         try:
-            more = _air.fetch_queue(QUEUE_PREFETCH, s["filters"]["industry"],
-                                    s["filters"]["lead_type"])
+            more = _air.fetch_queue(QUEUE_PREFETCH, s["filters"].get("industry"),
+                                    s["filters"].get("pile"))
             seen = {l["id"] for l in s["queue"]}
             s["queue"].extend([l for l in more if l["id"] not in seen])
         except Exception as e:  # noqa: BLE001

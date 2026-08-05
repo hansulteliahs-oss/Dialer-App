@@ -32,14 +32,11 @@
       </label>
       <label class="ctl">
         <span>list</span>
-        <select id="lead-type">
-          <option value="">best order (shopped &rarr; hiring &rarr; today &rarr; queued)</option>
-          <option value="Mystery Shopped">shopped, never replied</option>
-          <option value="Hiring Signal">hiring signal</option>
-          <option value="Cold">cold</option>
-        </select>
+        <select id="pile"></select>
       </label>
     </div>
+
+    <p id="pile-hint" class="pile-hint"></p>
 
     <button id="start" class="start">START</button>
     <p id="idle-status" class="idle-status"></p>

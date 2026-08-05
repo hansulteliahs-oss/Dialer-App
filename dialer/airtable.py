@@ -62,9 +62,24 @@ BASE_EXCLUSIONS = (
     "NOT(AND({Status}='Snoozed', IS_AFTER({Next Action}, TODAY())))",
 )
 
-# The ranked queue. Defaults are already the best order, so "just hit Start"
-# always works; the pickers narrow it, they do not reorder it.
+# The ranked queue, hottest first. Defaults are already the best order, so "just
+# hit Start" always works; the picker chooses which pile, it does not reorder.
 TIERS = (
+    # A callback whose date has arrived. Ranked above everything because it is
+    # the only tier where he made a promise to a human.
+    #
+    # THIS TIER IS WHY THE COLD PILE IS NOT ONE-SHOT. Every non-terminal
+    # disposition writes Status=Snoozed with a future Next Action, and nothing
+    # anywhere flips Snoozed back when that date arrives - cold_call_log.py and
+    # sdr_write.py both decide Call-Today-vs-Snoozed at write time and neither
+    # owns the roll-forward. Tiers below match on Status, so before this tier
+    # existed a dialed cold row matched nothing on its callback date and was
+    # never dialed again: one attempt each, forever, and the 4-attempt
+    # retirement could never fire. Keying tier 0 on the DATE rather than on
+    # Status is what closes that, and it matches how the rest of the AIOS
+    # queues (tools/pull_sdr_book.py reads Next Action, not Status).
+    ("callback_due",
+     "AND({Next Action}!='', NOT(IS_AFTER({Next Action}, TODAY())))"),
     # 89 rows he mystery-shopped that never replied to their own quote form.
     # The strongest opener in the playbook.
     ("mystery_no_reply",
@@ -75,11 +90,30 @@ TIERS = (
 )
 
 TIER_LABELS = {
+    "callback_due": "callback due",
     "mystery_no_reply": "shopped, never replied",
     "hiring_signal": "hiring signal",
     "call_today": "call today",
     "queued": "queued",
 }
+
+# The two piles the picker offers. Ordered tuples - the tier ranking survives
+# inside each pile, so a due callback still outranks a shopped row.
+#
+# `priority` deliberately falls through to `queued` at the end rather than
+# stopping when the warm tiers run dry. A 20-dial session that exhausts the warm
+# rows must not hit the tally early and hand him a finished screen at 11 of 20;
+# it keeps dialing. That is what makes it "prioritize" and not "only".
+# `callback_due` is in BOTH piles on purpose. The point of the tier is that a
+# promise made to a human is never buried, and that guarantee is worth more
+# unconditional than it is tidy: picking the cold grind must not be a way to
+# silently skip the callbacks the last cold grind created.
+PILES = {
+    "priority": ("callback_due", "mystery_no_reply", "hiring_signal",
+                 "call_today", "queued"),
+    "cold": ("callback_due", "queued"),
+}
+DEFAULT_PILE = "priority"
 
 
 def normalize_phone(raw: str | None) -> str | None:
@@ -155,18 +189,15 @@ class AirtableClient:
     # --- queue ---------------------------------------------------------------
 
     @staticmethod
-    def _formula(tier_clause: str, industry: str | None, lead_type: str | None) -> str:
+    def _formula(tier_clause: str, industry: str | None) -> str:
         clauses = [tier_clause, *BASE_EXCLUSIONS]
         if industry:
             clauses.append("{Industry}='%s'" % industry.replace("'", ""))
-        if lead_type:
-            clauses.append("{Lead Type}='%s'" % lead_type.replace("'", ""))
         return "AND(" + ", ".join(clauses) + ")"
 
-    def fetch_tier(self, tier_clause: str, limit: int,
-                   industry=None, lead_type=None) -> list[dict]:
+    def fetch_tier(self, tier_clause: str, limit: int, industry=None) -> list[dict]:
         params = [
-            ("filterByFormula", self._formula(tier_clause, industry, lead_type)),
+            ("filterByFormula", self._formula(tier_clause, industry)),
             ("pageSize", str(min(limit, 100))),
             ("maxRecords", str(limit)),
             # oldest first: the list has been sitting since 2026-05, and the rows
@@ -181,14 +212,23 @@ class AirtableClient:
         return resp.get("records", [])
 
     def fetch_queue(self, limit: int = 25, industry: str | None = None,
-                    lead_type: str | None = None) -> list[dict]:
-        """The ranked queue, tier by tier, deduped, capped at `limit`."""
+                    pile: str | None = None) -> list[dict]:
+        """The ranked queue for one pile, tier by tier, deduped, capped at `limit`.
+
+        An unknown pile falls back to `priority` rather than raising. A bad value
+        must never be able to empty the queue - a session that cannot build a
+        list is a session that stops, which is the one outcome this app exists to
+        prevent.
+        """
+        wanted = PILES.get(pile or DEFAULT_PILE, PILES[DEFAULT_PILE])
         seen: set[str] = set()
         out: list[dict] = []
         for tier_name, clause in TIERS:
+            if tier_name not in wanted:
+                continue
             if len(out) >= limit:
                 break
-            for rec in self.fetch_tier(clause, limit - len(out), industry, lead_type):
+            for rec in self.fetch_tier(clause, limit - len(out), industry):
                 if rec["id"] in seen:
                     continue
                 f = rec.get("fields", {}) or {}
@@ -406,6 +446,29 @@ def _selftest() -> int:
         fails.append("queue contains an unnormalizable phone")
     if len({l["id"] for l in q}) != len(q):
         fails.append("queue contains duplicate record ids")
+
+    print("\npiles:")
+    for name in PILES:
+        p = c.fetch_queue(limit=8, pile=name)
+        tiers = [l["tier"] for l in p]
+        print(f"  {name:<9} {len(p):>2} leads, tiers={sorted(set(tiers))}")
+        stray = set(tiers) - set(PILES[name])
+        if stray:
+            fails.append(f"pile {name} returned out-of-pile tiers {stray}")
+        if any(t == "queued" for t in tiers[:-1]) and name == "priority":
+            # queued is the fallthrough - it must never outrank a warm tier
+            first_queued = tiers.index("queued")
+            if any(t != "queued" for t in tiers[first_queued:]):
+                fails.append("priority put a warm tier after the cold fallthrough")
+
+    # An unknown pile must degrade to priority, never to an empty queue.
+    if not c.fetch_queue(limit=3, pile="nonsense"):
+        fails.append("an unknown pile emptied the queue instead of falling back")
+
+    # The promise guarantee: a due callback is reachable from EVERY pile.
+    for name in PILES:
+        if "callback_due" not in PILES[name]:
+            fails.append(f"pile {name} cannot reach a due callback")
 
     if fails:
         print(f"\nFAIL ({len(fails)})")

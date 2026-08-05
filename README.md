@@ -23,7 +23,7 @@ Dry run — real queue, simulated ring→outcome, zero Twilio spend, zero writes
 
 ```bash
 DIALER_DRY_RUN=1 DIALER_ARM_WRITE=0 DIALER_WARMUP_SECONDS=2 ./run.sh
-./.venv/bin/python3 packaging/dryrun_check.py   # 67-check verification harness
+./.venv/bin/python3 packaging/dryrun_check.py   # 79-check verification harness
 ```
 
 The harness sits through the warmup rather than bypassing it, so it needs the
@@ -273,17 +273,70 @@ Base `appEJYWOrT5NAbxOM`, table `tblURF0GnyhgKIzJj` (`Call List`).
 **Re-read the live schema before changing any of this** — Eliahs runs parallel
 Claude sessions and cached field lists go stale within minutes.
 
-### Queue ranking (defaults; the pickers narrow, they do not reorder)
+### The two piles
 
-| # | Tier | Dialable rows |
-|---|---|---|
-| 1 | `Lead Type = Mystery Shopped` **and** `Shop Result = No Response` | 89 |
-| 2 | `Lead Type = Hiring Signal` | 28 |
-| 3 | remaining `Status = Call Today` | 10 |
-| 4 | `Status = Queued`, oldest `Date Added` first | 5,710 |
+The list picker offers exactly two choices. Both are ranked internally — the
+picker chooses which pile, it never reorders one.
 
-Tier 1 is the 89 rows whose own quote form he submitted and who never replied —
-the strongest opener in the playbook. 72 carry a real first name.
+| Pile | Tiers, in order |
+|---|---|
+| **priority** (default) | callback due → shopped, never replied → hiring signal → call today → *queued* |
+| **cold pile** | callback due → queued |
+
+`priority` deliberately falls through to `queued` at the end instead of stopping
+when the warm tiers run dry. A 20-dial session that exhausts them must not hit
+the tally at 11 of 20 and hand you a finished screen — it keeps dialing. That is
+what makes it *prioritize* rather than *only*.
+
+**`callback due` is in both piles on purpose.** Choosing the cold grind must not
+be a way to silently skip the callbacks the last cold grind created. A promise
+made to a human is never buried, whichever pile you pick.
+
+The industry picker still narrows within whichever pile is selected.
+
+### Why `callback due` exists — the bug it fixes
+
+Every non-terminal disposition writes `Status = Snoozed` with a future
+`Next Action`:
+
+```
+Busy, Call Back    -> Status=Snoozed  Next Action=+3d
+Conversation       -> Status=Snoozed  Next Action=+7d
+No Answer          -> Status=Snoozed  Next Action=+1d
+```
+
+**Nothing anywhere flips `Snoozed` back when that date arrives.**
+`cold_call_log.py` and `tools/sdr_write.py` both decide Call-Today-vs-Snoozed at
+*write* time from the date they are writing; neither owns the roll-forward.
+
+Every other tier matches on `Status`. So before this tier existed, a dialed cold
+row matched nothing on its callback date and was **never dialed again** — one
+attempt each, forever, and the 4-attempt retirement could never fire on a cold
+row. It was invisible only because the 11 dispositions logged to date all landed
+on Mystery Shopped rows, and that tier matches on `Lead Type` with no `Status`
+clause, so those recycled correctly.
+
+`callback_due` keys on the **date**, not on `Status`, which is how the rest of
+the AIOS queues — `tools/pull_sdr_book.py` reads `Next Action` too. Pinned by a
+regression check in `dryrun_check.py`.
+
+### Queue ranking (tiers, hottest first)
+
+| # | Tier | Matches on | Dialable rows |
+|---|---|---|---|
+| 0 | `callback due` — `Next Action` today or earlier | **date** | 4 |
+| 1 | `Lead Type = Mystery Shopped` **and** `Shop Result = No Response` | lead type | 89 |
+| 2 | `Lead Type = Hiring Signal` | lead type | 28 |
+| 3 | remaining `Status = Call Today` | status | 8 |
+| 4 | `Status = Queued`, oldest `Date Added` first | status | 5,710 |
+
+Rows land in the **first** tier they match and are deduped from there, which is
+why tier 3 reads 8 and not the 127 rows actually carrying `Status = Call Today` —
+the other 119 are already claimed by tiers 1 and 2.
+
+Tier 0 is the only tier where a promise was made to a human, so it outranks
+everything. Tier 1 is the 89 rows whose own quote form he submitted and who never
+replied — the strongest opener in the playbook. 72 carry a real first name.
 
 **Always excluded:** `DNC = true`; `Status = Done` (retired); `Last Call Date` =
 today; blank/unnormalizable phone; and a `Snoozed` row whose `Next Action` is
@@ -369,7 +422,7 @@ dialer/twilio_voice.py    token minting, child-call lookup, caller-ID guards (--
 static/                   index.html, dialer.js, dialer.css, manifest.json, vendor/
 twilio-function/dial.js   deployed once to Twilio Functions, Protected
 packaging/provision_twilio.py   idempotent Twilio setup
-packaging/dryrun_check.py       67-check verification harness
+packaging/dryrun_check.py       79-check verification harness
 packaging/install.sh            builds the icon, installs /Applications/No Brakes.app
 state/                    gitignored: session, pending writes, abandons, logs
 ```
