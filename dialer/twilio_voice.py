@@ -205,12 +205,8 @@ class TwilioVoice:
 
 
 def _selftest() -> int:
-    from pathlib import Path
-    root = Path(__file__).resolve().parent.parent
-    for line in (root / ".env").read_text().splitlines() if (root / ".env").exists() else []:
-        if "=" in line and not line.strip().startswith("#"):
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+    from . import ROOT, load_env
+    load_env(ROOT / ".env")
 
     fails = []
 

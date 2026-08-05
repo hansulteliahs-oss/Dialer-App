@@ -193,10 +193,8 @@ def main():
 
     print("\n=== 12. DNC row is refused at dial time, not just filtered ===")
     from dialer.airtable import AirtableClient  # noqa: E402
-    for line in (ROOT / ".env").read_text().splitlines():
-        if "=" in line and not line.startswith("#"):
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+    from dialer import load_env
+    load_env(ROOT / ".env")
     air = AirtableClient(arm_write=False)
     dnc_rows = air._request(
         "GET", f"/{air.base_id}/{air.table_id}?filterByFormula=%7BDNC%7D&pageSize=1"

@@ -35,10 +35,8 @@ STATE_DIR = ROOT / "state"
 STATIC_DIR = ROOT / "static"
 
 # Load .env before importing anything that reads os.environ at construction time.
-for _line in (ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists() else []:
-    if "=" in _line and not _line.strip().startswith("#"):
-        _k, _v = _line.split("=", 1)
-        os.environ.setdefault(_k.strip(), _v.strip())
+from dialer import load_env                       # noqa: E402
+load_env(ROOT / ".env")
 
 from dialer import outcomes                      # noqa: E402
 from dialer.airtable import AirtableClient        # noqa: E402

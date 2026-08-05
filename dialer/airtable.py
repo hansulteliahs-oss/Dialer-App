@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from . import outcomes
+from . import load_env, outcomes
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "state"
@@ -362,10 +362,8 @@ class AirtableClient:
 
 
 def _selftest() -> int:
-    for line in (ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists() else []:
-        if "=" in line and not line.strip().startswith("#"):
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+    from . import load_env
+    load_env(ROOT / ".env")
 
     fails = []
     # phone normalization
