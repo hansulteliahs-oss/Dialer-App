@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>No Brakes</title>
+<!-- DNS + TLS to Twilio's US-West signaling edge, warm before the Device is
+     built. The edge here must match the `edge` option in dialer.js. -->
+<link rel="preconnect" href="https://voice-js.umatilla.twilio.com">
+<link rel="dns-prefetch" href="https://voice-js.umatilla.twilio.com">
+<link rel="dns-prefetch" href="https://eventgw.twilio.com">
 <link rel="manifest" href="/manifest.json">
 <link rel="stylesheet" href="/dialer.css">
 </head>

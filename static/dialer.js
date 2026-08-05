@@ -185,6 +185,10 @@ async function initDevice() {
     codecPreferences: ['opus', 'pcmu'],
     disableAudioContextSounds: false,
     logLevel: 'error',
+    // Pinned, not 'roaming': the default runs a GeoDNS resolution before the
+    // TLS + WebSocket handshake, on the dial path. This machine dials from one
+    // desk in Southern California; umatilla is the US-West edge.
+    edge: 'umatilla',
   });
   S.device.on('error', e => {
     console.error('[device]', e);
@@ -215,6 +219,25 @@ async function initDevice() {
       speaker: labels(a?.speakerDevices?.get()),
     });
   } catch (_) { /* diagnostics never block a dial */ }
+}
+
+/* Pre-pay the dial's setup while the clock is running on something else.
+   Measured 2026-08-05: token + Device + register() cost ~3-4s and ran lazily
+   inside the first dial - after 300 seconds of warmup in which nothing
+   happened. Called (never awaited) from the warmup, every breather, and the
+   resume gate. Failure is safe by design: dialNext() still awaits initDevice()
+   itself, so a dead prewarm costs exactly what today costs, and nothing here
+   may surface an error that reads like a reason to stop. */
+function prewarmDevice(where) {
+  if (S.cfg.dry_run) return;
+  const p = (S.device && S.device.state === 'unregistered')
+    ? S.device.register()   // socket dropped during a long breather; re-arm it
+    : initDevice();
+  Promise.resolve(p).catch(e => {
+    clientLog('warn', 'prewarm failed - the dial will pay setup itself', {
+      where, message: e && e.message,
+    });
+  });
 }
 
 async function unlockAudio() {
@@ -459,6 +482,8 @@ async function endCall(reason) {
    that are missing, and arrive at the first dial already warm. */
 function startWarmup() {
   show('warmup');
+  // Five minutes of free time starts now; the first dial's setup happens in it.
+  prewarmDevice('warmup');
   S.warmupTotal = S.session.warmup_seconds || S.cfg.warmup || 300;
   S.warmupEndsAt = Date.now() + (S.session.warmup_remaining || 0) * 1000;
   S.warmupEnding = false;
@@ -547,6 +572,9 @@ function renderWarmupLeads() {
 // --- breather ----------------------------------------------------------------
 
 function startBreather() {
+  // Keep the device warm between calls - a 120s conversation breather is long
+  // enough for a dropped socket to put setup back on the next dial.
+  prewarmDevice('breather');
   S.breatherTotal = S.session.breather_seconds || S.cfg.breather.dead_end;
   S.breatherEndsAt = Date.now() + (S.session.breather_remaining || 0) * 1000;
   $('breather').hidden = false;
@@ -910,6 +938,7 @@ function wireKeys() {
     if (!$('resume-gate').hidden) {
       $('resume-gate').hidden = true;
       await unlockAudio();
+      prewarmDevice('resume');   // covers every resume path in one line
       if (S.session.state === 'PAUSED') {
         S.pauseEndsAt = Date.now() + S.session.pause_remaining * 1000;
         show('paused'); tickPause();
