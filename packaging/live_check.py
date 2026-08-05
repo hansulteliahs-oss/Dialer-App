@@ -42,11 +42,26 @@ def find_test_rows(air: AirtableClient) -> list[dict]:
     return air._request("GET", f"/{air.base_id}/{air.table_id}?{qs}").get("records", [])
 
 
-def seed(air: AirtableClient) -> int:
+def seed(air: AirtableClient, target: str | None = None) -> int:
+    """Seed the test row. Defaults to TWILIO_CALLER_ID, but pass a number to dial
+    a different handset - calling your own line from your own caller ID is an edge
+    case (many carriers route it straight to voicemail) and it cannot verify that
+    the caller ID renders correctly on the receiving screen."""
     import os
-    cell = os.environ.get("TWILIO_CALLER_ID", "")
+    from dialer.airtable import normalize_phone
+
+    if target:
+        cell = normalize_phone(target)
+        if not cell:
+            print(f"{target!r} is not a dialable US number"); return 1
+    else:
+        cell = os.environ.get("TWILIO_CALLER_ID", "")
     if not cell:
         print("TWILIO_CALLER_ID not set"); return 1
+    if cell == os.environ.get("TWILIO_CALLER_ID"):
+        print("NOTE: dialing your own line. Carriers often send this straight to\n"
+              "      voicemail, and it cannot prove the caller ID renders. Pass a\n"
+              "      different number to test properly:  live_check.py seed 7025551234\n")
 
     for r in find_test_rows(air):
         air._request("DELETE", f"/{air.base_id}/{air.table_id}/{r['id']}")
@@ -162,7 +177,9 @@ def main() -> int:
     # seed/cleanup mutate the test row regardless of DIALER_ARM_WRITE — that flag
     # gates the dialer's own writes, not this harness's scaffolding.
     air = AirtableClient(arm_write=True)
-    return {"seed": seed, "verify": verify, "cleanup": cleanup}[cmd](air)
+    if cmd == "seed":
+        return seed(air, sys.argv[2] if len(sys.argv) > 2 else None)
+    return {"verify": verify, "cleanup": cleanup}[cmd](air)
 
 
 if __name__ == "__main__":
