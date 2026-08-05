@@ -25,7 +25,9 @@ import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
 
-BASE = "http://localhost:8787"
+# Overridable so this can be pointed at a throwaway instance on another port
+# without going anywhere near the live server on 8787.
+BASE = os.environ.get("DIALER_CHECK_BASE", "http://localhost:8787")
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -191,6 +193,17 @@ def main():
     d, _ = call("POST", "/api/dial", {})
     truthy("dial returned a phone", d.get("phone"))
     check("phone is E.164", d["phone"][:2], "+1")
+
+    # THE 2026-08-05 REGRESSION, server half. A countdown that came back to life
+    # in the browser fired a second dial while a call was live, and this endpoint
+    # took it: spent an attempt, reset current_call, and the client then tore
+    # down the call that was actually up. The browser has its own guards now, but
+    # this is the one that cannot be raced by a late response or a stale timer.
+    st_d, _ = call("GET", "/api/session")
+    _, code = call("POST", "/api/dial", {})
+    check("a second dial is refused while a call is in progress", code, 409)
+    st_after, _ = call("GET", "/api/session")
+    check("...and the refused dial is not counted", st_after["dials"], st_d["dials"])
     b, _ = call("POST", "/api/breather/start",
                 {"disposition": "No Answer", "connected": False, "breather": 15})
     check("breather length for a dead end", b.get("breather_seconds"), 15)
@@ -316,6 +329,21 @@ def main():
                          "Notes": "[2026-07-01] Conversation - call me in the fall"}}
     p2 = outcomes.build_payload(talked, "No Answer")
     check("a row that reached a human is never capped", p2["Status"], "Snoozed")
+
+    print("\n=== 15. client diagnostics reach the server log ===")
+    log = ROOT / "state" / "server.log"
+    before = log.stat().st_size if log.exists() else 0
+    marker = f"dryrun-probe-{int(time.time())}"
+    _, status = call("POST", "/api/client-log",
+                     {"level": "error", "msg": marker, "detail": {"probe": True}})
+    check("client-log accepts a line", status, 200)
+    # Junk must not be able to stop the dialer - the endpoint swallows it and
+    # still answers 200, because a logging failure mid-call is not worth a dial.
+    _, junk_status = call("POST", "/api/client-log", {"level": None, "msg": None})
+    check("client-log survives a malformed line", junk_status, 200)
+    time.sleep(0.3)
+    tail = log.read_text(errors="replace")[before:] if log.exists() else ""
+    truthy("the line lands in state/server.log", marker in tail)
 
     print("\n" + "=" * 64)
     if FAILS:

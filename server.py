@@ -269,6 +269,31 @@ def health():
     })
 
 
+@app.post("/api/client-log")
+def client_log():
+    """Everything that goes wrong goes wrong in the browser, where it dies with
+    the window. On 2026-08-05 a call produced no ringback and hung up at 13s of a
+    22s timeout, and the only way to see it was reconstructing the media failure
+    from Twilio timestamps - the actual error text was gone. This is the line it
+    should have been read off instead.
+
+    Fire-and-forget by contract: never raises, always 200. Nothing here may cost
+    a dial. A diagnostic that can stop the machine is worse than no diagnostic.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        level = str(body.get("level") or "info")[:12]
+        msg = str(body.get("msg") or "")[:400]
+        line = f"[client {level}] {msg}"
+        detail = body.get("detail")
+        if detail:
+            line += f" | {json.dumps(detail, default=str)[:600]}"
+        print(f"{datetime.now():%H:%M:%S} {line}", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+    return jsonify({"ok": True})
+
+
 @app.get("/api/config")
 def config():
     return jsonify({
@@ -393,6 +418,15 @@ def dial():
         if left > 0:
             return jsonify({"error": "warmup", "warmup_remaining": left,
                             "detail": f"{int(left)}s of warmup left"}), 425
+        # The browser must not be the only thing standing between a stale timer
+        # and a second call placed on top of a live one. On 2026-08-05 a
+        # resurrected countdown fired mid-conversation and this endpoint took
+        # the dial: it spent an attempt, reset current_call, and the client then
+        # tore down the call that was actually up. The state machine lives here,
+        # so the refusal belongs here too - the client guards are the courtesy,
+        # this is the guarantee.
+        if _session["state"] == "DIALING":
+            return jsonify({"error": "a call is already in progress"}), 409
         if _session["dials"] >= MAX_DIALS_PER_SESSION:
             return jsonify({"error": "session dial cap reached"}), 429
         lead = _session["queue"][_session["cursor"]]

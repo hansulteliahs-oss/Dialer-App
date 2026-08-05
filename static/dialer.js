@@ -38,6 +38,7 @@ const S = {
   escHeldTimer: null,
   typingHoldTimer: null,
   dateTouched: false,
+  ending: false,
 };
 
 // --- transport ---------------------------------------------------------------
@@ -55,12 +56,34 @@ async function api(path, opts = {}) {
   return data;
 }
 
+/* Ship a diagnostic line to the server so it lands in state/server.log. The
+   browser is where every failure actually happens and the window takes the
+   evidence with it when it closes - see the 2026-08-05 silent call.
+
+   Fire-and-forget on purpose: not awaited, errors swallowed, keepalive set so a
+   line written as the page tears down still leaves. Logging may never cost a
+   dial, and it may never call banner() - that would recurse. */
+function clientLog(level, msg, detail) {
+  try {
+    fetch('/api/client-log', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({level, msg: String(msg), detail: detail || null}),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (_) { /* never */ }
+}
+
 function banner(msg, kind = '') {
   const b = $('banner');
   if (!msg) { b.hidden = true; return; }
   b.textContent = msg;
   b.className = 'banner ' + kind;
   b.hidden = false;
+  // One banner element means the second message silently overwrites the first,
+  // which is exactly how "it showed a couple of things" became unanswerable.
+  // Every message that ever reaches the screen gets a line, in order.
+  clientLog(kind === 'warn' ? 'warn' : 'error', 'banner: ' + msg);
 }
 
 function writeStatus(msg, kind = '') {
@@ -117,6 +140,19 @@ async function boot() {
     if (S.session && S.session.active) { e.preventDefault(); e.returnValue = ''; }
   });
 
+  // Anything that escapes a handler kills the loop silently - the countdown just
+  // stops and the window looks like it is waiting on him.
+  window.addEventListener('error', ev => clientLog('error', 'uncaught', {
+    message: ev.message, at: `${ev.filename}:${ev.lineno}`,
+  }));
+  window.addEventListener('unhandledrejection', ev => clientLog('error', 'unhandled rejection', {
+    reason: String(ev.reason && (ev.reason.message || ev.reason)),
+  }));
+  // Chrome throttles timers hard once this window is hidden, and the session
+  // stalls mid-breather. Timestamped either side, the log shows that directly.
+  document.addEventListener('visibilitychange',
+    () => clientLog('info', 'window ' + document.visibilityState));
+
   S.session = await api('/api/session');
   if (S.session.active) {
     // Resume. No Start button, no fresh slate. The browser still needs one
@@ -148,6 +184,10 @@ async function initDevice() {
   });
   S.device.on('error', e => {
     console.error('[device]', e);
+    clientLog('error', 'twilio device error', {
+      code: e.code, message: e.message, explanation: e.explanation,
+      causes: e.causes, solutions: e.solutions,
+    });
     // Loud, but the queue keeps advancing. No technical problem may produce a
     // moment where stopping is easier than continuing.
     banner('Twilio: ' + (e.message || e.code));
@@ -157,15 +197,34 @@ async function initDevice() {
     if (fresh.token) S.device.updateToken(fresh.token);
   });
   await S.device.register();
+
+  // Which speaker the SDK actually chose. Chrome snapshots its device list at
+  // launch, so headphones connected afterwards can leave "default" pointing at
+  // hardware that is gone - silent ringback, and nothing on screen says so.
+  try {
+    const a = S.device.audio;
+    const labels = c => [...(c?.values?.() || c || [])].map(d => d.label || d.deviceId);
+    clientLog('info', 'device registered', {
+      inputs: labels(a?.availableInputDevices),
+      outputs: labels(a?.availableOutputDevices),
+      speaker: labels(a?.speakerDevices?.get()),
+    });
+  } catch (_) { /* diagnostics never block a dial */ }
 }
 
 async function unlockAudio() {
   if (S.audioUnlocked) return;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    // Read the label before stopping the track - a stopped track reports none.
+    clientLog('info', 'mic opened', {device: stream.getAudioTracks()[0]?.label || '?'});
     stream.getTracks().forEach(t => t.stop());
     S.audioUnlocked = true;
   } catch (e) {
+    // NotAllowedError is a permission problem, NotFoundError is no input device
+    // at all, OverconstrainedError is a device that vanished. Three different
+    // fixes, and the banner cannot tell him which one he has.
+    clientLog('error', 'getUserMedia failed', {name: e.name, message: e.message});
     banner('Microphone blocked — the queue keeps moving but he cannot be heard');
   }
 }
@@ -174,7 +233,18 @@ async function unlockAudio() {
 
 async function dialNext() {
   if (S.busy) return;
+  // A call in progress outranks anything the loop wants. S.busy only covers the
+  // moment of dialling - it clears as soon as connect() resolves, so it is false
+  // for the entire conversation. The SDK would refuse the second connect anyway,
+  // but only after this function had spent a dial and overwritten parentSid and
+  // connectedAt, which is what filed an answered call as a No Answer.
+  if (S.call) { clientLog('warn', 'dial suppressed - a call is already live'); return; }
   S.busy = true;
+  // Reopen the teardown latch here, not after /api/dial answers. A dial that
+  // throws still has to be able to end - otherwise a network blip on the request
+  // leaves the latch shut from the previous call and the loop never breathes
+  // again. The guard above already proved no call is live.
+  S.ending = false;
   try {
     stopBreather();
     const r = await api('/api/dial', {body: {}});
@@ -210,6 +280,11 @@ async function dialNext() {
     }
   } catch (e) {
     console.error(e);
+    clientLog('error', 'dial threw', {name: e.name, code: e.code, message: e.message});
+    // If a call is up, the attempt is the thing that was wrong - not the call.
+    // Tearing down here is what hung up on a receptionist mid-sentence: the
+    // teardown fires 5s later and disconnects whatever is on the line.
+    if (S.call) { S.busy = false; return; }
     setDialState('dial failed', 'failed');
     banner('Dial error: ' + (e.message || e));
     // Attempts is deliberately NOT incremented on a dial error.
@@ -224,12 +299,23 @@ function wireCall(call) {
     // CallSid must be read INSIDE the accept handler, not after connect()
     // resolves. answerOnBridge means this fires when the leg is bridged.
     S.parentSid = call.parameters.CallSid;
+    clientLog('info', 'call accepted', {sid: S.parentSid});
     api('/api/call-sid', {body: {call_sid: S.parentSid}});
     startPolling();
   });
-  call.on('disconnect', () => endCall('remote'));
-  call.on('cancel', () => endCall('remote'));
-  call.on('error', e => { console.error('[call]', e); endCall('error'); });
+  // The one event that proves media reached this end. answerOnBridge sends real
+  // ringback down the same path as speech, so no 'ringing' line means he heard
+  // silence - which is a media failure, not a lead who did not pick up.
+  call.on('ringing', hasEarlyMedia => clientLog('info', 'ringback', {hasEarlyMedia}));
+  call.on('disconnect', () => { clientLog('info', 'call disconnect'); endCall('remote'); });
+  call.on('cancel', () => { clientLog('info', 'call cancel'); endCall('remote'); });
+  call.on('error', e => {
+    console.error('[call]', e);
+    clientLog('error', 'twilio call error', {
+      code: e.code, message: e.message, explanation: e.explanation, causes: e.causes,
+    });
+    endCall('error');
+  });
 }
 
 function startPolling() {
@@ -269,9 +355,22 @@ function simulateCall() {
 }
 
 async function endCall(reason) {
+  // One call ends once. Twilio fires 'error' and 'disconnect' for the same call
+  // and both used to run a full teardown - two /api/breather/start requests, two
+  // countdown loops racing one deadline, and four commits stacked on the next
+  // expiry. Cleared when the next dial goes out.
+  if (S.ending) return;
+  S.ending = true;
   stopPolling();
   stopCallTimer();
   const connectedSecs = S.connectedAt ? (Date.now() - S.connectedAt) / 1000 : 0;
+  // Who ended it, and how far into the dial. A short ring that reads 'error' or
+  // 'remote' rather than a keypress is this end hanging up on itself.
+  clientLog('info', 'call ended', {
+    reason,
+    connectedSecs: Math.round(connectedSecs),
+    ringSecs: S.dialStartedAt ? Math.round((Date.now() - S.dialStartedAt) / 1000) : null,
+  });
 
   if (S.call && !S.cfg.dry_run) {
     try { S.call.disconnect(); } catch (_) {}
@@ -429,6 +528,10 @@ function tickBreather() {
 
 async function commitAndDial() {
   if (S.busy) return;
+  // Every timer path into the loop funnels through here - the 1s watchdog, the
+  // rAF tick, ENTER, the pause resume. Only a live breather may commit, so a
+  // stale deadline can never become a dial while he is on the phone.
+  if (!S.session || S.session.state !== 'BREATHER') return;
   S.breatherEndsAt = null;
   const r = await api('/api/outcome', {body: {}});
   if (r.write) {
@@ -453,12 +556,17 @@ async function holdForTyping() {
   }, S.cfg.breather.typing_resume_after * 1000);
 
   const r = await api('/api/breather/hold', {body: {}});
-  if (r.ok) {
-    const target = Date.now() + r.breather_remaining * 1000;
-    if (target > S.breatherEndsAt) {
-      S.breatherEndsAt = target;
-      S.breatherTotal = Math.max(S.breatherTotal, r.breather_remaining);
-    }
+  // The check at the top of this function is worthless by the time the response
+  // lands: he commits, the next number goes out, and this resolves onto a
+  // session that is already ringing. So re-check here - and treat a null
+  // deadline as "the breather is over", not as zero. `target > null` is true for
+  // every timestamp, which is exactly how a dead countdown came back to life and
+  // dialed on top of a live call on 2026-08-05.
+  if (!r.ok || !S.session || S.session.state !== 'BREATHER' || !S.breatherEndsAt) return;
+  const target = Date.now() + r.breather_remaining * 1000;
+  if (target > S.breatherEndsAt) {
+    S.breatherEndsAt = target;
+    S.breatherTotal = Math.max(S.breatherTotal, r.breather_remaining);
   }
 }
 
@@ -864,7 +972,12 @@ function wireBreather() {
   });
   note.addEventListener('keydown', e => {
     // ENTER commits from inside the note too; SHIFT+ENTER makes a newline.
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitAndDial(); }
+    // stopPropagation because the document-level handler ALSO commits on ENTER
+    // and does not check whether he is typing - one keypress was producing two
+    // commits and two /api/outcome requests.
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault(); e.stopPropagation(); commitAndDial();
+    }
   });
 
   $('next-action').addEventListener('change', e => {
@@ -921,6 +1034,14 @@ function wireAbandon() {
     const r = await api('/api/abandon', {body: {sentence: inp.value.trim()}});
     if (r.ok) { S.session = null; location.reload(); }
   });
+}
+
+/* Test seam. packaging/client_check.js drives these real functions through the
+   timing races that killed a live call on 2026-08-05. A test that re-implements
+   the guards instead of calling them is a test that passes while the bug ships.
+   Absent in the browser - nothing sets this flag but the harness. */
+if (typeof window !== 'undefined' && window.__NOBRAKES_TEST__) {
+  window.__nb = {S, boot, holdForTyping, commitAndDial, dialNext, endCall, startBreather};
 }
 
 boot().catch(e => { console.error(e); banner('Startup failed: ' + e.message); });
