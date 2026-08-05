@@ -26,10 +26,10 @@ import os
 import re
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
+
+import requests
 
 from . import load_env, outcomes
 
@@ -151,40 +151,55 @@ class AirtableClient:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         self._retry_thread = None
         self._stop = threading.Event()
+        # One keep-alive session for every call. urllib paid a fresh TCP + TLS
+        # handshake per request, and the DNC re-check sits on the dial path -
+        # most of its measured cost was the handshake, not Airtable. requests
+        # re-establishes transparently if Airtable closes the idle connection;
+        # the warm() pings from server.py keep that from happening mid-session.
+        self._http = requests.Session()
+        self._http.headers.update({
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "no-brakes-dialer/1.0",
+        })
 
     # --- transport -----------------------------------------------------------
 
     def _request(self, method: str, path: str, body: dict | None = None,
                  timeout: int = 30) -> dict:
         url = f"{API_ROOT}{path}"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "no-brakes-dialer/1.0",
-        }
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         last = ""
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    return json.loads(r.read().decode())
-            except urllib.error.HTTPError as e:
-                last = e.read().decode("utf-8", errors="replace")[:400]
-                if e.code == 429 and attempt < 2:
-                    time.sleep(int(e.headers.get("Retry-After", "5")))
-                    continue
-                if 500 <= e.code < 600 and attempt < 2:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise AirtableError(f"{method} {path} -> {e.code}: {last}") from e
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                r = self._http.request(method, url, json=body, timeout=timeout)
+            except requests.RequestException as e:
                 last = str(e)
                 if attempt < 2:
                     time.sleep(2 ** attempt)
                     continue
                 raise AirtableError(f"{method} {path} -> {last}") from e
+            if r.status_code == 429 and attempt < 2:
+                time.sleep(int(r.headers.get("Retry-After", "5")))
+                continue
+            if 500 <= r.status_code < 600 and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code >= 400:
+                last = r.text[:400]
+                raise AirtableError(f"{method} {path} -> {r.status_code}: {last}")
+            return r.json()
         raise AirtableError(f"{method} {path}: retries exhausted ({last})")
+
+    def warm(self) -> None:
+        """Keep the TLS connection alive between dials. A tiny GET, called from
+        a background thread while a session is active - never on the dial path,
+        and a failure means nothing (the next real call just pays the handshake).
+        """
+        try:
+            qs = urllib.parse.urlencode([("maxRecords", "1"), ("fields[]", "Phone")])
+            self._request("GET", f"/{self.base_id}/{self.table_id}?{qs}", timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
 
     # --- queue ---------------------------------------------------------------
 
@@ -266,8 +281,9 @@ class AirtableClient:
                     break
         return out
 
-    def get_record(self, record_id: str) -> dict:
-        return self._request("GET", f"/{self.base_id}/{self.table_id}/{record_id}")
+    def get_record(self, record_id: str, timeout: int = 30) -> dict:
+        return self._request("GET", f"/{self.base_id}/{self.table_id}/{record_id}",
+                             timeout=timeout)
 
     def assert_dialable(self, record_id: str) -> str:
         """Re-check DNC immediately before connect(). Returns the E.164 number.
@@ -275,8 +291,14 @@ class AirtableClient:
         The second half of hard refusal #1. The queue filter can go stale between
         pull and dial - he runs parallel Claude sessions and the SDR agent writes
         to these same rows.
+
+        timeout=6, not the default 30: this is the one Airtable call on the dial
+        path, and the retry loop can stack three timeouts plus backoff. 30s each
+        meant a flaky patch could hold a dial hostage for a minute and a half;
+        6s keeps the worst case under twenty seconds, and the check still fails
+        CLOSED - no answer from Airtable means no dial, never a blind one.
         """
-        rec = self.get_record(record_id)
+        rec = self.get_record(record_id, timeout=6)
         f = rec.get("fields", {}) or {}
         if f.get("DNC"):
             raise AirtableError(

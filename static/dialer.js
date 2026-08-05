@@ -37,9 +37,29 @@ const S = {
   busy: false,
   escHeldTimer: null,
   typingHoldTimer: null,
+  deadlineTimer: null,
   dateTouched: false,
   ending: false,
 };
+
+/* Fire exactly at a deadline instead of waiting for the next rAF or the 1s
+   watchdog to notice it passed - that slop was a measured second between the
+   warmup expiring and the first dial going out. The deadline is read fresh at
+   fire time because typing extends the breather: a timer armed at breather
+   start would otherwise fire under his fingers and commit early. Re-arms
+   itself at the new deadline instead. The rAF ticks and the watchdog stay -
+   this is the precise path, they are the backstop. */
+function armDeadline(getEndsAt, fire) {
+  clearTimeout(S.deadlineTimer);
+  const at = getEndsAt();
+  if (!at) return;
+  S.deadlineTimer = setTimeout(() => {
+    const fresh = getEndsAt();
+    if (!fresh) return;                      // state moved on; nothing to fire
+    if (Date.now() >= fresh - 20) fire();
+    else armDeadline(getEndsAt, fire);       // typing pushed the deadline out
+  }, Math.max(0, at - Date.now()) + 5);
+}
 
 // --- transport ---------------------------------------------------------------
 
@@ -489,6 +509,7 @@ function startWarmup() {
   S.warmupEnding = false;
   $('warmup-target').textContent = S.session.target;
   renderWarmupLeads();
+  armDeadline(() => S.warmupEndsAt, endWarmup);
   tickWarmup();
 }
 
@@ -511,6 +532,7 @@ async function endWarmup() {
     // the server is the authority on when the lock-in is over.
     S.warmupEndsAt = Date.now() + ((r.session && r.session.warmup_remaining) || 1) * 1000;
     S.warmupEnding = false;
+    armDeadline(() => S.warmupEndsAt, endWarmup);
     tickWarmup();
     return;
   }
@@ -585,12 +607,14 @@ function startBreather() {
   const note = $('note');
   note.value = '';
   note.focus();
+  armDeadline(() => S.breatherEndsAt, commitAndDial);
   tickBreather();
 }
 
 function stopBreather() {
   $('breather').hidden = true;
   S.breatherEndsAt = null;
+  clearTimeout(S.deadlineTimer);
 }
 
 function tickBreather() {

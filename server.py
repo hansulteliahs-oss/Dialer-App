@@ -775,6 +775,16 @@ def bootstrap() -> None:
     _air = AirtableClient()
     _air.start_retry_thread()
 
+    # Keep the Airtable TLS connection warm while a session is running, so the
+    # per-dial DNC re-check rides an existing socket instead of paying a fresh
+    # handshake. Off the dial path by construction; a failed ping costs nothing.
+    def _keep_airtable_warm():
+        while True:
+            time.sleep(45)
+            if _session is not None and _session.get("state") != "TALLY":
+                _air.warm()
+    threading.Thread(target=_keep_airtable_warm, daemon=True).start()
+
     if DRY_RUN:
         print("DIALER_DRY_RUN=1 - simulating calls, zero Twilio spend")
         # Still construct Twilio so the caller-ID guards are exercised, but

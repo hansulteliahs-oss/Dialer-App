@@ -123,6 +123,9 @@ function boot(opts = {}) {
   FakeDate.now = () => CLOCK;
   FakeDate.prototype = RealDate.prototype;
   sandbox.Date = FakeDate;
+  // The dial-timing marks read performance.now(). Same fake clock as Date.now()
+  // so a stepped test still reports coherent spans instead of real wall time.
+  sandbox.performance = {now: () => CLOCK};
 
   sandbox.setTimeout = (fn, ms) => {
     const t = {id: nextTimerId++, fn, at: CLOCK + (ms || 0), every: null};
