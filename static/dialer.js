@@ -99,6 +99,7 @@ async function boot() {
 
   buildDispositionRow();
   buildPilePicker();
+  buildPlaybook();
   wireKeys();
   // requestAnimationFrame throttles hard if the window ever loses foreground.
   // The countdown must fire regardless — a stalled timer is a brake.
@@ -401,6 +402,10 @@ function startBreather() {
   S.breatherTotal = S.session.breather_seconds || S.cfg.breather.dead_end;
   S.breatherEndsAt = Date.now() + (S.session.breather_remaining || 0) * 1000;
   $('breather').hidden = false;
+  // Full angles only on the long breather. On a 15-second dead end there is no
+  // objection to review - nobody picked up - and eight paragraphs on a screen he
+  // has no time to read is just noise between him and the next dial.
+  $('angles-card').hidden = S.breatherTotal < S.cfg.breather.real;
   const note = $('note');
   note.value = '';
   note.focus();
@@ -501,6 +506,93 @@ function buildPilePicker() {
   hint();
 }
 
+/* --- talk track ---------------------------------------------------------- */
+
+/* All three panels are static content, so they are built once at boot rather
+   than on every render(). They must never throw: playbook.js failing to load
+   has to cost him three panels, not the dialer. */
+function buildPlaybook() {
+  const P = window.PLAYBOOK;
+  if (!P) { console.warn('[playbook] not loaded — talk track panels are off'); return; }
+
+  const beats = $('warmup-beats');
+  for (const [name, body] of (P.beats || [])) {
+    const li = document.createElement('li');
+    li.innerHTML = '<b></b> ';
+    li.querySelector('b').textContent = name;
+    li.append(document.createTextNode(body));
+    beats.append(li);
+  }
+  const rules = $('warmup-rules');
+  for (const r of (P.rules || [])) {
+    const li = document.createElement('li');
+    li.textContent = r;
+    rules.append(li);
+  }
+
+  const rail = $('rail-list');
+  for (const [trigger, angle] of (P.rail || [])) {
+    const li = document.createElement('li');
+    const t = document.createElement('span');
+    t.className = 'rail-trigger';
+    t.textContent = trigger;
+    const a = document.createElement('span');
+    a.className = 'rail-angle';
+    a.textContent = angle;
+    li.append(t, a);
+    rail.append(li);
+  }
+
+  const angles = $('angles-list');
+  for (const [q, a] of (P.angles || [])) {
+    const wrap = document.createElement('div');
+    const qq = document.createElement('div');
+    qq.className = 'angles-q';
+    qq.textContent = q;
+    const aa = document.createElement('div');
+    aa.className = 'angles-a';
+    aa.textContent = a;
+    wrap.append(qq, aa);
+    angles.append(wrap);
+  }
+}
+
+/* Loose match for "these two say the same thing". The promise note is usually a
+   hand-retyped restatement of the log line it came from, so exact comparison
+   never fires: "call back monday 8/3" vs "call back on monday (8/3)". Punctuation
+   and a few connectives are the entire difference, so both go. */
+const NOISE_WORDS = /^(on|at|in|of|to|for|the|a|an|and|his|her|their|they)$/;
+function normalizeNote(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/).filter(w => w && !NOISE_WORDS.test(w)).join(' ');
+}
+
+/* Callback rows only. `next_action_note` is the promise he made; `notes` is the
+   running log the promise came out of. Both already ride in the queue payload,
+   so this costs no extra fetch - they were being served and thrown away. */
+function renderCallbackNotes(lead) {
+  const box = $('callback-notes');
+  const isCallback = lead.tier === 'callback_due';
+  const promise = (lead.next_action_note || '').trim();
+  const log = (lead.notes || '').trim();
+
+  if (!isCallback || (!promise && !log)) { box.hidden = true; return; }
+
+  // Falls back to the log when the promise line is empty, so the panel is never
+  // an empty amber box on a row that plainly has history.
+  $('callback-promise').textContent = promise || log;
+
+  // The log earns its space only by saying something the promise line does not.
+  // Directional on purpose: a log that CONTAINS the promise is longer and richer,
+  // so it stays; only a log that is a restatement or a subset is dropped.
+  const nLog = normalizeNote(log);
+  const nPromise = normalizeNote(promise ? promise : log);
+  const redundant = !nLog || nLog === nPromise || nPromise.includes(nLog);
+  $('callback-log').textContent = redundant ? '' : log;
+
+  box.hidden = false;
+}
+
 async function setDisposition(label) {
   if (!S.session || !S.session.pending_outcome) return;
   const r = await api('/api/breather/update', {body: {disposition: label}});
@@ -576,7 +668,15 @@ function render() {
     const badge = $('attempt-badge');
     badge.textContent = `attempt ${att} of 4`;
     badge.classList.toggle('last', att >= 4);
+
+    renderCallbackNotes(lead);
   }
+
+  // The rail is for the seconds he is actually on the line. During the breather
+  // this column belongs to the up-next card, so they are strict opposites.
+  const dialing = s.state === 'DIALING';
+  $('objection-rail').hidden = !dialing;
+  $('dial-row').classList.toggle('norail', !dialing);
 
   const nxt = s.next_lead;
   if (nxt) {

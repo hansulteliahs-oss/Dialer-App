@@ -57,6 +57,11 @@
         Dialing starts on its own. <b id="warmup-target">20</b> calls.<br>
         No key skips this. Read the top of the list.
       </p>
+      <div class="beats">
+        <div class="beats-label">the shape</div>
+        <ol id="warmup-beats" class="beats-list"></ol>
+        <ul id="warmup-rules" class="beats-rules"></ul>
+      </div>
       <p class="warmup-fine">
         Hold <b>ESC</b> to abandon &mdash; that ends the session, not the wait.
       </p>
@@ -80,15 +85,31 @@
   </header>
 
   <div class="stage">
-    <div class="lead-main">
-      <div id="lead-company" class="company">&mdash;</div>
-      <div class="lead-meta">
-        <span id="lead-name" class="name"></span>
-        <span id="lead-industry" class="pill"></span>
-        <span id="lead-phone" class="phone"></span>
+    <div id="dial-row" class="dial-row">
+      <div class="lead-main">
+        <div id="lead-company" class="company">&mdash;</div>
+        <div class="lead-meta">
+          <span id="lead-name" class="name"></span>
+          <span id="lead-industry" class="pill"></span>
+          <span id="lead-phone" class="phone"></span>
+        </div>
+        <div id="lead-cue" class="cue" hidden></div>
+        <!-- Callback rows only. What he told this person last time, which is
+             the whole reason the row came back around. -->
+        <div id="callback-notes" class="callback" hidden>
+          <div class="callback-label">you said you&rsquo;d call back</div>
+          <div id="callback-promise" class="callback-promise"></div>
+          <div id="callback-log" class="callback-log"></div>
+        </div>
+        <div id="dial-state" class="dial-state"></div>
       </div>
-      <div id="lead-cue" class="cue" hidden></div>
-      <div id="dial-state" class="dial-state"></div>
+
+      <!-- Objection rail. Angles, not lines. Live during DIALING only; the
+           breather reuses this column for the up-next card. -->
+      <aside id="objection-rail" class="rail" hidden>
+        <div class="next-label">if they say</div>
+        <ul id="rail-list" class="rail-list"></ul>
+      </aside>
     </div>
 
     <!-- BREATHER --------------------------------------------------------- -->
@@ -114,15 +135,24 @@
         </div>
       </div>
 
-      <aside class="next-card" id="next-card">
-        <div class="next-label">up next</div>
-        <div id="next-company" class="next-company"></div>
-        <div id="next-meta" class="next-meta"></div>
-        <div id="next-cue" class="next-cue"></div>
-        <a id="cslb-link" class="cslb" target="_blank" rel="noopener" hidden>
-          look up the owner's name on CSLB &rarr;
-        </a>
-      </aside>
+      <div class="breather-right">
+        <aside class="next-card" id="next-card">
+          <div class="next-label">up next</div>
+          <div id="next-company" class="next-company"></div>
+          <div id="next-meta" class="next-meta"></div>
+          <div id="next-cue" class="next-cue"></div>
+          <a id="cslb-link" class="cslb" target="_blank" rel="noopener" hidden>
+            look up the owner's name on CSLB &rarr;
+          </a>
+        </aside>
+
+        <!-- Long breather only. After a real conversation he has two minutes
+             and may have just fumbled one of these. -->
+        <aside class="angles-card" id="angles-card" hidden>
+          <div class="next-label">objection angles</div>
+          <div id="angles-list" class="angles-list"></div>
+        </aside>
+      </div>
     </div>
   </div>
 
@@ -186,6 +216,7 @@
 <div id="banner" class="banner" hidden></div>
 
 <script src="/vendor/twilio-voice.min.js"></script>
+<script src="/playbook.js"></script>
 <script src="/dialer.js"></script>
 </body>
 </html>

@@ -392,6 +392,52 @@ independently. **The dialer is the primary writer; the CLI is the fallback.**
 The contract is documented in both repos. `outcomes.py --selftest` pins the
 behaviour.
 
+`static/playbook.js` is the second copy of the same kind of problem: every line
+in it is a compression of `references/cold-call-playbook.md` in the AIOS repo.
+Change that file's four beats or its eight objections and this one has to move
+with it, by hand, in the other repo. Nothing checks.
+
+---
+
+## The talk track on screen
+
+Three panels, and **which screen each lives on is the whole design**. He is an
+introvert running an exposure ladder; the failure mode is freezing, and the
+second failure mode is reading, which sounds exactly like reading. So the amount
+of text on a screen is inversely proportional to how likely he is to be talking
+to a human while looking at it.
+
+| Panel | Screen | Why there |
+|---|---|---|
+| **The four beats** + non-negotiables | warmup | Five idle minutes and nothing else to do with his eyes. The only dose of talk track that costs nothing. |
+| **Objection rail** — 8 trigger → angle lines | live card, `DIALING` only | Glanceable, never readable-aloud. Twelve words is the ceiling. |
+| **Objection angles** — same 8 at full length | breather, **long one only** | After a real conversation he has two minutes and may have just fumbled one. Absent from the 15s dead end, where nobody picked up and it would be noise. |
+
+The rail and the up-next card share the same 330px column and are strict
+opposites — rail while dialing, up-next while breathing. Same slot in both
+states so the eye never has to re-find it between calls.
+
+**A separate tab was considered and is functionally broken here**, not merely
+worse: the key handler is bound to `document`, so `SPACE`, `ENTER`, `1`–`5` and
+`D` all go to whatever tab has focus. Reading the playbook in another tab means
+being unable to end the call or log the disposition. A second physical screen
+(iPad) does not have that problem and is fine as a reference shelf for the
+between-call material — voicemail policy, gatekeeper nav, the DNC wording.
+
+### Callback notes
+
+Rows on tier `callback_due` get an amber panel carrying `Next Action Note` (the
+promise) and `Notes` (the log it came from). Both were already in the queue
+payload and were being served and thrown away — `render()` simply never drew
+them, so the four calls he owes people opened with no memory of what he'd said.
+
+The log is dropped when it only restates the promise. Comparison is normalized
+(punctuation and connectives stripped) because the promise note is usually a
+hand-retyped version of the log line: *"call back monday 8/3"* vs *"call back on
+monday (8/3)"* is the real pair off the Morrison row, and exact comparison never
+fires on it. Directional on purpose — a log that *contains* the promise is richer
+and stays.
+
 ---
 
 ## Failure modes — the machine never stops
@@ -420,6 +466,7 @@ dialer/airtable.py        queue pull, outcome PATCH, retry queue, DNC refusal
 dialer/outcomes.py        disposition -> fields, next-action, retirement  (--selftest)
 dialer/twilio_voice.py    token minting, child-call lookup, caller-ID guards (--selftest)
 static/                   index.html, dialer.js, dialer.css, manifest.json, vendor/
+static/playbook.js        the on-screen talk track (beats, rail, angles) — content only
 twilio-function/dial.js   deployed once to Twilio Functions, Protected
 packaging/provision_twilio.py   idempotent Twilio setup
 packaging/dryrun_check.py       79-check verification harness
