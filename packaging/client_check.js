@@ -463,6 +463,68 @@ async function main() {
         'the key stole a character out of a real note'));
   }
 
+  console.log('\n=== 6c. typing holds the timer without one request per keystroke ===');
+  {
+    /* Measured 2026-08-05: a real session fired 1235 POST /api/breather/hold,
+       one per keystroke, unthrottled - while the sibling note-save call in the
+       SAME input handler was debounced 400ms. Each of those requests does 0.0ms
+       of work server-side and cost 50.8ms median / 138.8ms max, all of it blocked
+       on the global lock behind /api/outcome's Airtable round-trip.
+
+       Two things have to stay true at once, which is why this test asserts both:
+       the network call is throttled, and the VISUAL hold is not. Throttling the
+       class too would leave him typing a note with no on-screen proof the
+       countdown is held. */
+    const h = boot();
+    await flush(); await flush();
+    const S = h.nb().S;
+    S.cfg = CFG;
+    S.session = SESSION('BREATHER');
+    S.breatherEndsAt = h.now() + 15000;
+    h.nb().startBreather();
+    await flush();
+
+    const note = h.els.note;
+    const holdsSince = n => h.calls.slice(n).filter(c => c.path === '/api/breather/hold').length;
+
+    const before = h.calls.length;
+    for (const ch of 'called back monday') {         // 18 keystrokes, one burst
+      note.value += ch;
+      note.fire('input');
+      await flush();
+    }
+    check('a burst of keystrokes sends ONE hold, not one per key', () =>
+      assert.strictEqual(holdsSince(before), 1,
+        `${holdsSince(before)} hold requests for 18 keystrokes`));
+    check('...and the countdown still shows as held on every keystroke', () =>
+      assert.ok(h.els['ring-wrap-holder'].classList.contains('held'),
+        'the visual hold was throttled along with the request'));
+
+    // Past the throttle window, the next keystroke renews the hold - otherwise a
+    // long note would let the countdown expire mid-sentence.
+    const mid = h.calls.length;
+    await h.advance(2500);
+    note.value += '!';
+    note.fire('input');
+    await flush(); await flush();
+    check('typing past the throttle window sends a fresh hold', () =>
+      assert.strictEqual(holdsSince(mid), 1,
+        'the throttle never reopened - a long note would expire mid-sentence'));
+
+    // A new breather must not inherit the previous note's throttle stamp, or its
+    // very first keystroke is swallowed.
+    S.session = SESSION('BREATHER');
+    h.nb().startBreather();
+    await flush();
+    const fresh = h.calls.length;
+    h.els.note.value = 'x';
+    h.els.note.fire('input');
+    await flush(); await flush();
+    check('a fresh breather holds on its first keystroke', () =>
+      assert.strictEqual(holdsSince(fresh), 1,
+        'the first keystroke of the new note was eaten by the old throttle window'));
+  }
+
   console.log('\n=== 7. one ENTER is one commit ===');
   {
     // The note's keydown handler commits, and the document-level handler commits

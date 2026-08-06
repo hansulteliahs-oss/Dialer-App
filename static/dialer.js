@@ -784,6 +784,9 @@ function startBreather() {
   const note = $('note');
   note.value = '';
   note.focus();
+  // Fresh breather, fresh throttle window - or the first keystroke of this note
+  // could be swallowed by a hold sent during the previous one.
+  S.lastHoldAt = 0;
   armDeadline(() => S.breatherEndsAt, commitAndDial);
   tickBreather();
 }
@@ -846,15 +849,38 @@ async function commitAndDial() {
   dialNext();
 }
 
+/* One network call per this many ms of continuous typing. The endpoint only ever
+   pushes the deadline to now + TYPING_RESUME_AFTER (10s), so anything more often
+   than this buys nothing: after the last request of a burst he still has at least
+   8 seconds of grace, and the next keystroke past the window renews it.
+
+   Measured 2026-08-05: a real session fired 1235 of these, one per keystroke. The
+   request does 0.0ms of work server-side - it compares and sets one float - but
+   cost 50.8ms median and 138.8ms max, ALL of it spent blocked on the global lock
+   behind /api/outcome's Airtable round-trip. So this is not bandwidth hygiene: it
+   is ~85% fewer chances for a keypress to land in that stall, in an app whose
+   entire premise is not touching the mouse. */
+const HOLD_THROTTLE_MS = 2000;
+
 /* Typing holds the timer. It only extends while words are being produced, so it
    cannot be used to stall. */
 async function holdForTyping() {
   if (!S.session || S.session.state !== 'BREATHER') return;
+  // The visual hold stays on EVERY keystroke, deliberately outside the throttle.
+  // Throttling the class as well would leave two code paths owning the same bit
+  // of screen state, and the one thing he must never doubt mid-note is whether
+  // the countdown is actually held.
   $('ring-wrap-holder').classList.add('held');
   clearTimeout(S.typingHoldTimer);
   S.typingHoldTimer = setTimeout(() => {
     $('ring-wrap-holder').classList.remove('held');
   }, S.cfg.breather.typing_resume_after * 1000);
+
+  // Leading edge: the first keystroke of a burst always goes out immediately, so
+  // a single character still holds the timer with no perceived delay.
+  const now = Date.now();
+  if (S.lastHoldAt && now - S.lastHoldAt < HOLD_THROTTLE_MS) return;
+  S.lastHoldAt = now;
 
   const r = await api('/api/breather/hold', {body: {}});
   // The check at the top of this function is worthless by the time the response
