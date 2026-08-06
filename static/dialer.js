@@ -63,17 +63,42 @@ function armDeadline(getEndsAt, fire) {
 
 // --- transport ---------------------------------------------------------------
 
+/* Every request gets a deadline, and no request ever throws.
+
+   Neither was true before. fetch() has no default timeout, so a request that
+   went out and never came back left the loop parked forever on an await, with
+   a countdown that had already stopped - indistinguishable, on screen, from
+   the machine waiting for him. And a rejected fetch (wifi dropped) propagated
+   out of callers like commitAndDial() that have no catch, killing the loop as
+   an unhandled rejection.
+
+   So: abort at the deadline, and hand every failure back as data using the
+   same __httpError shape callers already understand. A failed request becomes
+   a retry, never a stall. */
+const API_TIMEOUT_MS = 20000;
+
 async function api(path, opts = {}) {
-  const r = await fetch(path, {
-    headers: {'Content-Type': 'application/json'},
-    ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-    method: opts.method || (opts.body ? 'POST' : 'GET'),
-  });
-  let data = {};
-  try { data = await r.json(); } catch (_) {}
-  if (!r.ok) data.__httpError = r.status;
-  return data;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), opts.timeoutMs || API_TIMEOUT_MS);
+  try {
+    const r = await fetch(path, {
+      headers: {'Content-Type': 'application/json'},
+      ...opts,
+      signal: ctl.signal,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      method: opts.method || (opts.body ? 'POST' : 'GET'),
+    });
+    let data = {};
+    try { data = await r.json(); } catch (_) {}
+    if (!r.ok) data.__httpError = r.status;
+    return data;
+  } catch (e) {
+    const why = e && e.name === 'AbortError' ? 'timed out' : String(e && e.message || e);
+    clientLog('warn', 'request failed', {path, why});
+    return {__httpError: 0, __netError: why, error: `the server did not answer (${why})`};
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /* Ship a diagnostic line to the server so it lands in state/server.log. The
@@ -132,6 +157,13 @@ async function boot() {
 
   if (S.cfg.dry_run) banner('DRY RUN — simulated calls, no Twilio spend', 'warn');
   else if (!S.cfg.armed) banner('DIALER_ARM_WRITE=0 — nothing will be written to Airtable', 'warn');
+
+  // A write the retry queue gave up on means a call he actually made is not in
+  // Airtable. That has to be on the screen, not only in a log line.
+  if (S.cfg.dropped_writes) {
+    banner(`${S.cfg.dropped_writes} call outcome(s) never reached Airtable — `
+         + 'see state/dropped-writes.jsonl', 'warn');
+  }
 
   if (S.cfg.last_abandon) {
     const a = S.cfg.last_abandon;
@@ -394,6 +426,16 @@ async function dialNext() {
     timingMark('api_dial');
     if (r.error && !r.skipped) {
       banner(r.error);
+      // 9pm is a legal wall, not a transient refusal - it never clears today,
+      // so retrying every 5s forever just flashes a banner at him until he
+      // hold-ESCs out. Close the session out properly instead.
+      if (r.error === 'outside_call_window' || r.__httpError === 403) {
+        stopBreather();
+        S.busy = false;
+        banner('past the 9:00pm cutoff — stopping here', 'warn');
+        showTally();
+        return;
+      }
       // A refusal is not a stop. Wait a beat and take the next number.
       setTimeout(() => { S.busy = false; dialNext(); }, 5000);
       return;
@@ -422,6 +464,14 @@ async function dialNext() {
     if (S.cfg.dry_run) {
       simulateCall();
     } else {
+      // The SDK is a vendored file loaded by a plain <script> tag with no
+      // onerror. If it 404s or fails to execute, `Twilio` is simply undefined
+      // and `new Twilio.Device()` throws a bare ReferenceError - which used to
+      // land in the catch below and be filed as a No Answer. Name it here so
+      // the failure reads as what it is.
+      if (typeof Twilio === 'undefined' || !Twilio.Device) {
+        throw new Error('the Twilio voice SDK did not load — no call can be placed');
+      }
       await initDevice();
       timingMark('device');
       await unlockAudio();
@@ -440,12 +490,27 @@ async function dialNext() {
     // Tearing down here is what hung up on a receptionist mid-sentence: the
     // teardown fires 5s later and disconnects whatever is on the line.
     if (S.call) { S.busy = false; return; }
-    setDialState('dial failed', 'failed');
-    banner('Dial error: ' + (e.message || e));
-    // Attempts is deliberately NOT incremented on a dial error.
-    setTimeout(() => { S.busy = false; endCall('error'); }, 5000);
+
+    /* Reaching here with no S.call means device.connect() never returned a
+       call: nothing was dialled, nobody's phone rang. This used to run
+       endCall('error'), which derives its disposition from connectedSecs
+       alone - zero - and so wrote "No Answer", Attempts +1, Last Call Date =
+       today to a lead that was never called. With a broken SDK that repeats
+       for every lead in the queue, and at four of them outcomes.py retires the
+       row permanently. A whole morning's list closed out by a missing file.
+
+       So: no outcome, no advance, no attempt spent. Hold this lead, say so,
+       and come back to the same number. */
+    S.setupFails = (S.setupFails || 0) + 1;
+    setDialState('could not place the call', 'failed');
+    banner(S.setupFails >= 3
+      ? 'Cannot place calls: ' + (e.message || e) + ' — nothing is being written to Airtable'
+      : 'Could not place the call: ' + (e.message || e) + ' — retrying this number');
+    const wait = S.setupFails >= 3 ? 30000 : 8000;
+    setTimeout(() => { S.busy = false; dialNext(); }, wait);
     return;
   }
+  S.setupFails = 0;
   S.busy = false;
 }
 
@@ -486,9 +551,24 @@ function wireCall(call) {
 
 function startPolling() {
   stopPolling();
+  S.polling = false;
   S.pollTimer = setInterval(async () => {
     if (!S.parentSid) return;
-    const st = await api('/api/call-status?parent_sid=' + encodeURIComponent(S.parentSid));
+    // setInterval does not wait for the previous tick. A slow /api/call-status
+    // meant a new overlapping request every 1.2s for as long as the stall
+    // lasted, each one a fresh Flask thread reaching for the same Twilio
+    // client the SDK does not promise is thread-safe.
+    if (S.polling) return;
+    S.polling = true;
+    let st;
+    try {
+      st = await api('/api/call-status?parent_sid=' + encodeURIComponent(S.parentSid));
+    } finally {
+      S.polling = false;
+    }
+    // A failed poll is not a finished call. Saying otherwise would auto-advance
+    // off a call that is still up.
+    if (!st || st.__netError || st.__httpError) return;
     if (st.connected && !S.connectedAt) {
       S.connectedAt = Date.now();
       setDialState('connected', 'connected');
@@ -532,7 +612,8 @@ async function endCall(reason) {
   timingFlush('end:' + reason);
   stopPolling();
   stopCallTimer();
-  const connectedSecs = S.connectedAt ? (Date.now() - S.connectedAt) / 1000 : 0;
+  const connectedSecs = S.connectedAt
+    ? Math.max(0, (Date.now() - S.connectedAt - (S.sleepGapMs || 0)) / 1000) : 0;
   // Who ended it, and how far into the dial. A short ring that reads 'error' or
   // 'remote' rather than a keypress is this end hanging up on itself.
   clientLog('info', 'call ended', {
@@ -560,12 +641,31 @@ async function endCall(reason) {
     disposition = 'No Answer'; breather = S.cfg.breather.dead_end;
   }
 
-  S.session = await api('/api/breather/start', {
-    body: {disposition, connected: connectedSecs > 0, breather},
+  await openBreather(disposition, connectedSecs > 0, breather);
+}
+
+/* Parking the outcome is the one request the loop cannot skip - it is what
+   makes the next breather exist. If it failed, S.session was overwritten with
+   the error object, render() bailed on the missing `active`, and startBreather
+   armed a deadline off `undefined`: the countdown never ran, commitAndDial
+   refused a session that was not in BREATHER, and the loop simply stopped with
+   a screen that looked like it was waiting for him. Keep the old session and
+   keep asking instead. */
+async function openBreather(disposition, connected, breather, tries = 0) {
+  const b = await api('/api/breather/start', {body: {disposition, connected, breather}});
+  if (b && b.active) {
+    S.session = b;
+    S.dateTouched = false;
+    startBreather();
+    render();
+    return;
+  }
+  clientLog('error', 'breather/start failed', {
+    status: b && b.__httpError, why: b && b.__netError, tries,
   });
-  S.dateTouched = false;
-  startBreather();
-  render();
+  banner('lost the server for a moment — retrying', 'warn');
+  setTimeout(() => openBreather(disposition, connected, breather, tries + 1),
+             Math.min(2000 * (tries + 1), 10000));
 }
 
 // --- warmup ------------------------------------------------------------------
@@ -712,6 +812,20 @@ async function commitAndDial() {
   if (!S.session || S.session.state !== 'BREATHER') return;
   S.breatherEndsAt = null;
   const r = await api('/api/outcome', {body: {}});
+
+  /* A failed commit must never become a dial. The server still has this lead
+     as current and the cursor un-advanced, so falling through to dialNext()
+     here called the person he had just finished talking to a second time,
+     seconds later, with the real outcome of that call lost. Retry the commit;
+     do not move on until it lands. */
+  if (r.__httpError || r.__netError) {
+    clientLog('error', 'commit failed', {status: r.__httpError, why: r.__netError});
+    writeStatus('could not save that outcome — retrying', 'warn');
+    S.breatherEndsAt = Date.now() + 4000;
+    armDeadline(() => S.breatherEndsAt, commitAndDial);
+    return;
+  }
+
   if (r.write) {
     if (r.write.queued) writeStatus('write queued for retry', 'warn');
     else if (!r.write.armed) writeStatus('not armed — nothing written');
@@ -720,6 +834,15 @@ async function commitAndDial() {
   S.session = r.session || S.session;
   render();
   if (S.session.state === 'TALLY') { showTally(); return; }
+  // A pause asked for mid-call lands here, once the call it interrupted has
+  // been logged. The server owns the transition; this just follows it.
+  if (S.session.state === 'PAUSED') {
+    stopBreather();
+    S.pauseEndsAt = Date.now() + (S.session.pause_remaining || 0) * 1000;
+    show('paused');
+    tickPause();
+    return;
+  }
   dialNext();
 }
 
@@ -922,8 +1045,20 @@ function setDialState(text, cls = '') {
 function startCallTimer() {
   stopCallTimer();
   $('call-timer').classList.remove('live');
+  S.sleepGapMs = 0;
+  S.lastTick = Date.now();
   S.tickTimer = setInterval(() => {
-    const s = (Date.now() - S.dialStartedAt) / 1000;
+    // The Mac sleeping mid-call (lid closed, display sleep escalating) used to
+    // count as talk time: connectedSecs is raw wall clock, and >= 15s files the
+    // call as a Conversation with a 7-day follow-up. Forty minutes asleep after
+    // a two-second hello became a conversation that never happened, written to
+    // a real lead's row. A 250ms interval that skipped seconds is a gap, not
+    // talking, so measure it and take it back out.
+    const now = Date.now();
+    const drift = now - S.lastTick;
+    if (drift > 5000) S.sleepGapMs += drift;
+    S.lastTick = now;
+    const s = (now - S.dialStartedAt - S.sleepGapMs) / 1000;
     $('call-timer').textContent = fmtClock(s);
   }, 250);
 }
@@ -992,6 +1127,13 @@ function render() {
 function showTally() {
   stopBreather();
   const s = S.session;
+  // Why it ended. "20 of 20" and "the list ran out at 11 of 20" were the same
+  // screen, and only one of them means he is finished.
+  if (s.queue_exhausted && s.completed < s.target) {
+    banner(`the list ran dry at ${s.completed} of ${s.target} — widen the pile or the industry filter`, 'warn');
+  } else if (s.past_cutoff) {
+    banner('stopped at the 9:00pm legal cutoff', 'warn');
+  }
   $('t-dials').textContent = s.dials;
   $('t-connects').textContent = s.connects;
   $('t-convos').textContent = s.conversations;
@@ -1096,7 +1238,19 @@ function wireKeys() {
       else if (st === 'BREATHER') commitAndDial();
       return;
     }
-    if (st === 'BREATHER' && !typing) {
+    /* startBreather() focuses the note, and nothing ever blurs it - so for the
+       whole of every breather `typing` was true and these three branches never
+       ran. 1-5, D and P were documented as live during every breather and were
+       in fact dead on the keyboard: pressing 2 typed "2" into the note, D typed
+       "d", P typed "p". Only the mouse worked, in a keyboard-only app.
+
+       Gating on an EMPTY note instead restores all three without ever eating a
+       character out of a real note: the moment he has actually written
+       something, the note owns its own keys again. */
+    const noteEmpty = !$('note').value;
+    const keysLive = !typing || noteEmpty;
+
+    if (st === 'BREATHER' && keysLive) {
       if (S.cfg.dispositions[e.key]) {
         e.preventDefault();
         setDisposition(S.cfg.dispositions[e.key]);
@@ -1104,7 +1258,7 @@ function wireKeys() {
       }
       if (e.key.toLowerCase() === 'd') { e.preventDefault(); toggleDnc(); return; }
     }
-    if (e.key.toLowerCase() === 'p' && !typing) {
+    if (e.key.toLowerCase() === 'p' && keysLive) {
       e.preventDefault();
       requestPause();
     }
