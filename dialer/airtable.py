@@ -27,6 +27,7 @@ import re
 import threading
 import time
 import urllib.parse
+import uuid
 from pathlib import Path
 
 import requests
@@ -36,8 +37,32 @@ from . import load_env, outcomes
 ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "state"
 PENDING_FILE = STATE_DIR / "pending-writes.jsonl"
+# Where a queued write goes when the retry budget is spent. Nothing is ever
+# deleted from the queue silently - a dropped outcome could be a Meeting Booked.
+DROPPED_FILE = STATE_DIR / "dropped-writes.jsonl"
 
 API_ROOT = "https://api.airtable.com/v0"
+
+# Airtable evaluates TODAY() and NOW() in UTC - measured against the live base
+# 2026-08-05: DATETIME_DIFF(TODAY(), NOW(), 'hours') came back -19 at 12:32 PT,
+# i.e. TODAY() is anchored at UTC midnight, not his.
+#
+# That is a silent, time-of-day-dependent bug in every clause below. From 5:00pm
+# PT (00:00 UTC) until the 9:00pm cutoff - four hours of a legal dialing window -
+# TODAY() is already tomorrow, and all three date clauses invert:
+#
+#   * a callback due TOMORROW satisfies NOT(IS_AFTER({Next Action}, TODAY()))
+#     and gets dialed a day early. Dialing a promise early is the exact mirror
+#     image of the callback-burial bug this tier was built to fix.
+#   * a row dialed at 4pm no longer IS_SAME as TODAY(), so a queue refill can
+#     hand him a number he already called an hour ago.
+#   * a Snoozed row whose promise is not yet due becomes dialable.
+#
+# So anchor every date comparison to his wall clock instead. Verified live:
+# this expression equals the local date, IS_AFTER(tomorrow) is true, and
+# IS_AFTER(today) is false.
+PT_TODAY = ("DATETIME_PARSE(DATETIME_FORMAT("
+            "SET_TIMEZONE(NOW(), 'America/Los_Angeles'), 'YYYY-MM-DD'), 'YYYY-MM-DD')")
 
 # Fields the dialer reads. Everything the live screen and breather card need.
 QUEUE_FIELDS = [
@@ -58,8 +83,8 @@ BASE_EXCLUSIONS = (
     "NOT({DNC})",
     "{Status}!='Done'",
     "{Phone}!=''",
-    "NOT(IS_SAME({Last Call Date}, TODAY(), 'day'))",
-    "NOT(AND({Status}='Snoozed', IS_AFTER({Next Action}, TODAY())))",
+    "NOT(IS_SAME({Last Call Date}, %s, 'day'))" % PT_TODAY,
+    "NOT(AND({Status}='Snoozed', IS_AFTER({Next Action}, %s)))" % PT_TODAY,
 )
 
 # The ranked queue, hottest first. Defaults are already the best order, so "just
@@ -79,7 +104,7 @@ TIERS = (
     # Status is what closes that, and it matches how the rest of the AIOS
     # queues (tools/pull_sdr_book.py reads Next Action, not Status).
     ("callback_due",
-     "AND({Next Action}!='', NOT(IS_AFTER({Next Action}, TODAY())))"),
+     "AND({Next Action}!='', NOT(IS_AFTER({Next Action}, %s)))" % PT_TODAY),
     # 89 rows he mystery-shopped that never replied to their own quote form.
     # The strongest opener in the playbook.
     ("mystery_no_reply",
@@ -124,7 +149,11 @@ def normalize_phone(raw: str | None) -> str | None:
     """
     if not raw:
         return None
-    digits = re.sub(r"\D", "", str(raw))
+    # [^0-9], not \D: Python's \D is Unicode-aware and does NOT strip fullwidth
+    # or Arabic-Indic digits, so a Phone of "７６０-846-4537" survived as ten
+    # "digits" and returned "+1７６０8464537" - not E.164, and dialed anyway
+    # instead of being dropped from the queue the way the docstring promises.
+    digits = re.sub(r"[^0-9]", "", str(raw))
     if len(digits) == 11 and digits.startswith("1"):
         digits = digits[1:]
     if len(digits) != 10:
@@ -136,6 +165,18 @@ def normalize_phone(raw: str | None) -> str | None:
 
 class AirtableError(RuntimeError):
     pass
+
+
+class DialRefused(AirtableError):
+    """The ROW must not be dialed - DNC, or no usable number.
+
+    Deliberately distinct from "Airtable could not be reached to find out".
+    Both used to raise AirtableError, and /api/dial treated them the same way:
+    skip the lead, zero breather, next number. So with the wifi down the app
+    burned through all 80 prefetched leads in seconds - none of them actually
+    screened, none of them called - and landed on the tally screen looking like
+    a finished session. A refusal consumes a lead; an outage must not.
+    """
 
 
 class AirtableClient:
@@ -151,6 +192,9 @@ class AirtableClient:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         self._retry_thread = None
         self._stop = threading.Event()
+        # Serialises flush_pending(). See the comment there: overlapping replays
+        # double-count Attempts on a single dial.
+        self._flush_lock = threading.Lock()
         # One keep-alive session for every call. urllib paid a fresh TCP + TLS
         # handshake per request, and the DNC re-check sits on the dial path -
         # most of its measured cost was the handshake, not Airtable. requests
@@ -169,26 +213,62 @@ class AirtableClient:
                  timeout: int = 30) -> dict:
         url = f"{API_ROOT}{path}"
         last = ""
+        # `timeout` bounds one response, not the whole call. A 429 arrives
+        # promptly as a real HTTP response, so it never touches the timeout
+        # branch - it lands on the backoff below, which used to sleep for
+        # whatever Retry-After said (Airtable's lockout is 30s) regardless of
+        # the caller's budget. assert_dialable passes timeout=6 and documents a
+        # "worst case under twenty seconds"; two 429s made it 60s+. He runs
+        # parallel Claude sessions against this same base, so 429 is the normal
+        # failure here, not the exotic one. Give the whole call a deadline and
+        # never sleep past it.
+        deadline = time.monotonic() + (timeout * 3)
         for attempt in range(3):
             try:
                 r = self._http.request(method, url, json=body, timeout=timeout)
             except requests.RequestException as e:
                 last = str(e)
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+                if attempt < 2 and self._nap(2 ** attempt, deadline):
                     continue
                 raise AirtableError(f"{method} {path} -> {last}") from e
             if r.status_code == 429 and attempt < 2:
-                time.sleep(int(r.headers.get("Retry-After", "5")))
-                continue
+                if self._nap(int(r.headers.get("Retry-After", "5")), deadline):
+                    continue
+                raise AirtableError(f"{method} {path} -> 429: retry budget spent")
             if 500 <= r.status_code < 600 and attempt < 2:
-                time.sleep(2 ** attempt)
-                continue
+                if self._nap(2 ** attempt, deadline):
+                    continue
+                raise AirtableError(f"{method} {path} -> {r.status_code}: retry budget spent")
             if r.status_code >= 400:
                 last = r.text[:400]
                 raise AirtableError(f"{method} {path} -> {r.status_code}: {last}")
-            return r.json()
+            try:
+                return r.json()
+            except ValueError as e:
+                # A 2xx with a body json can't parse (proxy hiccup, truncated
+                # response) used to raise a bare JSONDecodeError from OUTSIDE
+                # every except in this file. It escaped log_outcome's
+                # `except AirtableError`, escaped _commit_pending, and 500'd
+                # /api/outcome - losing the outcome without even queueing it.
+                # Every failure out of this method is an AirtableError so the
+                # callers' one catch is actually total.
+                raise AirtableError(
+                    f"{method} {path} -> {r.status_code} with an unreadable body"
+                ) from e
         raise AirtableError(f"{method} {path}: retries exhausted ({last})")
+
+    @staticmethod
+    def _nap(seconds: float, deadline: float) -> bool:
+        """Sleep out a backoff, but never past the call's deadline.
+
+        Returns False when the budget is spent, which means "stop retrying"
+        rather than "sleep anyway". Failing fast beats holding a dial hostage.
+        """
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(seconds, left))
+        return True
 
     def warm(self) -> None:
         """Keep the TLS connection alive between dials. A tiny GET, called from
@@ -207,10 +287,17 @@ class AirtableClient:
     def _formula(tier_clause: str, industry: str | None) -> str:
         clauses = [tier_clause, *BASE_EXCLUSIONS]
         if industry:
-            clauses.append("{Industry}='%s'" % industry.replace("'", ""))
+            # Airtable escapes a quote inside a string literal by DOUBLING it.
+            # Stripping it instead meant an Industry containing an apostrophe
+            # could never match its own rows - a silently empty queue, reported
+            # to him as "no dialable leads match those filters". Doubling is
+            # also what keeps this from being an injection point: the only
+            # character that could close the literal is now escaped, not deleted.
+            clauses.append("{Industry}='%s'" % industry.replace("'", "''"))
         return "AND(" + ", ".join(clauses) + ")"
 
-    def fetch_tier(self, tier_clause: str, limit: int, industry=None) -> list[dict]:
+    def fetch_tier(self, tier_clause: str, limit: int, industry=None,
+                   timeout: int = 30) -> list[dict]:
         params = [
             ("filterByFormula", self._formula(tier_clause, industry)),
             ("pageSize", str(min(limit, 100))),
@@ -223,11 +310,12 @@ class AirtableClient:
         for f in QUEUE_FIELDS:
             params.append(("fields[]", f))
         qs = urllib.parse.urlencode(params)
-        resp = self._request("GET", f"/{self.base_id}/{self.table_id}?{qs}")
+        resp = self._request("GET", f"/{self.base_id}/{self.table_id}?{qs}",
+                             timeout=timeout)
         return resp.get("records", [])
 
     def fetch_queue(self, limit: int = 25, industry: str | None = None,
-                    pile: str | None = None) -> list[dict]:
+                    pile: str | None = None, timeout: int = 30) -> list[dict]:
         """The ranked queue for one pile, tier by tier, deduped, capped at `limit`.
 
         An unknown pile falls back to `priority` rather than raising. A bad value
@@ -243,7 +331,7 @@ class AirtableClient:
                 continue
             if len(out) >= limit:
                 break
-            for rec in self.fetch_tier(clause, limit - len(out), industry):
+            for rec in self.fetch_tier(clause, limit - len(out), industry, timeout):
                 if rec["id"] in seen:
                     continue
                 f = rec.get("fields", {}) or {}
@@ -301,12 +389,12 @@ class AirtableClient:
         rec = self.get_record(record_id, timeout=6)
         f = rec.get("fields", {}) or {}
         if f.get("DNC"):
-            raise AirtableError(
+            raise DialRefused(
                 f"REFUSED: {f.get('Company', record_id)} is marked DNC. Never dialing this row."
             )
         phone = normalize_phone(f.get("Phone"))
         if not phone:
-            raise AirtableError(f"REFUSED: {record_id} has no dialable phone number")
+            raise DialRefused(f"REFUSED: {record_id} has no dialable phone number")
         return phone
 
     # --- writes --------------------------------------------------------------
@@ -320,7 +408,7 @@ class AirtableClient:
         """
         try:
             rec = self.get_record(record_id)
-        except AirtableError as e:
+        except Exception as e:  # noqa: BLE001 - the docstring promises no raise
             # Fall back to a bare record so the outcome is not lost. Attempts will
             # be recomputed on replay from the live row.
             rec = {"id": record_id, "fields": {}}
@@ -329,10 +417,25 @@ class AirtableClient:
             return {"ok": False, "armed": self.arm_write, "queued": True,
                     "error": str(e), "payload": None}
 
-        payload = outcomes.build_payload(
-            rec, disposition, note=note, next_action=next_action,
-            next_note=next_note, dnc=dnc,
-        )
+        try:
+            payload = outcomes.build_payload(
+                rec, disposition, note=note, next_action=next_action,
+                next_note=next_note, dnc=dnc,
+            )
+        except ValueError as e:
+            # The docstring above promises this never raises, and it did: an
+            # unparseable follow-up date reached resolve_next_action() and the
+            # ValueError escaped all the way out to a 500 on /api/outcome,
+            # losing the call. The date is the least important of the seven
+            # fields - Disposition, Last Call Date and Attempts are what the
+            # accountability stack counts - so drop the date, keep the dial,
+            # and say so in the Notes rather than throwing the call away.
+            print(f"[bad follow-up date, logging the dial without it] {e}", flush=True)
+            salvage = f"{note.strip()} " if note and note.strip() else ""
+            payload = outcomes.build_payload(
+                rec, disposition, note=f"{salvage}(follow-up date rejected: {e})",
+                next_action=None, next_note=next_note, dnc=dnc,
+            )
 
         if not self.arm_write:
             print(f"[DIALER_ARM_WRITE=0] would PATCH {record_id}: "
@@ -343,7 +446,7 @@ class AirtableClient:
             self._request("PATCH", f"/{self.base_id}/{self.table_id}/{record_id}",
                           {"fields": payload})
             return {"ok": True, "armed": True, "queued": False, "payload": payload}
-        except AirtableError as e:
+        except Exception as e:  # noqa: BLE001 - see the docstring: this NEVER raises
             self._queue_pending(record_id, disposition, note, next_action, next_note, dnc,
                                 reason=str(e))
             return {"ok": False, "armed": True, "queued": True,
@@ -353,6 +456,9 @@ class AirtableClient:
                        dnc, reason) -> None:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         entry = {
+            # Identity, so a replay running concurrently with this append can
+            # tell "already handled" from "arrived while I was working".
+            "uid": uuid.uuid4().hex,
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "record_id": record_id,
             "disposition": disposition,
@@ -363,9 +469,17 @@ class AirtableClient:
             "reason": reason,
             "attempts": 0,
         }
-        with PENDING_FILE.open("a") as fh:
-            fh.write(json.dumps(entry) + "\n")
-        print(f"[queued for retry] {record_id}: {reason}")
+        try:
+            with PENDING_FILE.open("a") as fh:
+                fh.write(json.dumps(entry) + "\n")
+            print(f"[queued for retry] {record_id}: {reason}")
+        except Exception as e:  # noqa: BLE001
+            # This is the last net under a failed write. If it throws too (disk
+            # full, state/ not writable) it must still not take the session
+            # down - the outcome is already lost at that point and stalling the
+            # machine on top of it helps nobody.
+            print(f"[LOST OUTCOME] {record_id} {disposition}: {reason} "
+                  f"(and the retry queue is unwritable: {e})", flush=True)
 
     def flush_pending(self) -> dict:
         """Replay queued writes. Rebuilds each payload from the live row so the
@@ -375,32 +489,88 @@ class AirtableClient:
         if not self.arm_write:
             return {"replayed": 0, "remaining": sum(1 for _ in PENDING_FILE.open())}
 
-        lines = [l for l in PENDING_FILE.read_text().splitlines() if l.strip()]
-        still: list[str] = []
-        replayed = 0
-        for line in lines:
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            try:
-                rec = self.get_record(e["record_id"])
-                payload = outcomes.build_payload(
-                    rec, e["disposition"], note=e.get("note"),
-                    next_action=e.get("next_action"), next_note=e.get("next_note"),
-                    dnc=e.get("dnc", False),
-                )
-                self._request("PATCH",
-                              f"/{self.base_id}/{self.table_id}/{e['record_id']}",
-                              {"fields": payload})
-                replayed += 1
-            except Exception as err:  # noqa: BLE001 - never let a replay kill the session
-                e["attempts"] = e.get("attempts", 0) + 1
-                e["reason"] = str(err)
-                if e["attempts"] < 20:
-                    still.append(json.dumps(e))
-        PENDING_FILE.write_text("\n".join(still) + ("\n" if still else ""))
-        return {"replayed": replayed, "remaining": len(still)}
+        # Only one replay at a time. The retry thread fires every 45s, bootstrap
+        # calls this, and GET /api/pending calls it from a request thread - all
+        # three could run together, and each rebuilds Attempts from the live row
+        # before PATCHing. Two overlapping replays of the same entry therefore
+        # incremented Attempts TWICE for one physical dial and appended the note
+        # twice, which can also trip the 4-attempt retirement a call early.
+        if not self._flush_lock.acquire(blocking=False):
+            return {"replayed": 0, "remaining": -1, "busy": True}
+        try:
+            lines = [l for l in PENDING_FILE.read_text().splitlines() if l.strip()]
+            still: list[str] = []
+            done: set[str] = set()
+            replayed = 0
+            for line in lines:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                done.add(e.get("uid") or line)
+                try:
+                    rec = self.get_record(e["record_id"])
+                    payload = outcomes.build_payload(
+                        rec, e["disposition"], note=e.get("note"),
+                        next_action=e.get("next_action"), next_note=e.get("next_note"),
+                        dnc=e.get("dnc", False),
+                    )
+                    self._request("PATCH",
+                                  f"/{self.base_id}/{self.table_id}/{e['record_id']}",
+                                  {"fields": payload})
+                    replayed += 1
+                except Exception as err:  # noqa: BLE001 - never let a replay kill the session
+                    e["attempts"] = e.get("attempts", 0) + 1
+                    e["reason"] = str(err)
+                    if e["attempts"] < 20:
+                        still.append(json.dumps(e))
+                    else:
+                        # 20 failures is ~15 minutes of outage. Deleting the line
+                        # here threw the outcome away in silence - it could be a
+                        # Meeting Booked. Park it where a human can find it and
+                        # say so loudly instead.
+                        self._drop(e)
+
+            # A commit that failed WHILE this replay was running appended to the
+            # file we are about to rewrite. Re-read and carry those forward, or
+            # write_text() would silently erase them.
+            fresh = []
+            for line in PENDING_FILE.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    uid = json.loads(line).get("uid") or line
+                except json.JSONDecodeError:
+                    continue
+                if uid not in done:
+                    fresh.append(line)
+
+            out = still + fresh
+            tmp = PENDING_FILE.with_suffix(".tmp")
+            tmp.write_text("\n".join(out) + ("\n" if out else ""))
+            tmp.replace(PENDING_FILE)
+            return {"replayed": replayed, "remaining": len(out)}
+        finally:
+            self._flush_lock.release()
+
+    def _drop(self, entry: dict) -> None:
+        """Give up on a queued write - visibly. Never silently."""
+        try:
+            with DROPPED_FILE.open("a") as fh:
+                fh.write(json.dumps(entry) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"[GAVE UP after {entry.get('attempts')} tries] "
+              f"{entry.get('record_id')} {entry.get('disposition')} -> "
+              f"{DROPPED_FILE.name}: {entry.get('reason')}", flush=True)
+
+    def dropped_count(self) -> int:
+        """How many outcomes were abandoned. Surfaced in the window so a lost
+        write is visible rather than invisible."""
+        try:
+            return sum(1 for l in DROPPED_FILE.read_text().splitlines() if l.strip())
+        except OSError:
+            return 0
 
     def start_retry_thread(self, interval: int = 45) -> None:
         if self._retry_thread:
