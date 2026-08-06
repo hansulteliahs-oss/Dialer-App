@@ -29,8 +29,9 @@ import sys
 import threading
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -43,7 +44,9 @@ from dialer import load_env                       # noqa: E402
 load_env(ROOT / ".env")
 
 from dialer import outcomes                      # noqa: E402
-from dialer.airtable import DEFAULT_PILE, PILES, TIER_LABELS, AirtableClient  # noqa: E402
+from dialer.airtable import (  # noqa: E402
+    DEFAULT_PILE, PILES, TIER_LABELS, AirtableClient, AirtableError, DialRefused,
+)
 from dialer.twilio_voice import TwilioConfigError, TwilioVoice  # noqa: E402
 
 PORT = int(os.environ.get("DIALER_PORT", "8787"))
@@ -87,18 +90,26 @@ def session_path(d: str | None = None) -> Path:
 
 
 def save_session() -> None:
+    """Persist the session. Never raises.
+
+    Called from every mutating route AND from bootstrap(), which runs before
+    app.run() and is guarded only by `except TwilioConfigError`. A full disk or
+    an unwritable state/ therefore used to crash the launch outright with a raw
+    traceback, or 500 a route mid-session. Losing the on-disk copy is bad;
+    refusing to dial because of it is worse.
+    """
     if _session is None:
         return
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = session_path(_session["date"]).with_suffix(".tmp")
-    tmp.write_text(json.dumps(_session, indent=2, default=str))
-    tmp.replace(session_path(_session["date"]))
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = session_path(_session["date"]).with_suffix(".tmp")
+        tmp.write_text(json.dumps(_session, indent=2, default=str))
+        tmp.replace(session_path(_session["date"]))
+    except Exception as e:  # noqa: BLE001
+        print(f"[SESSION NOT SAVED - resume will be stale] {e}", flush=True)
 
 
-def load_session() -> dict | None:
-    p = session_path()
-    if not p.exists():
-        return None
+def _read_session(p: Path) -> dict | None:
     try:
         s = json.loads(p.read_text())
     except (json.JSONDecodeError, OSError):
@@ -106,6 +117,34 @@ def load_session() -> dict | None:
     if s.get("abandoned") or s.get("state") == "DONE":
         return None
     return s
+
+
+def load_session() -> dict | None:
+    """The session to resume, if there is one.
+
+    Looks for today's file first, then falls back to the newest unfinished one.
+    Keying only on today's date orphaned any session that outlived local
+    midnight - the file kept yesterday's name, nothing ever looked for it
+    again, and a parked outcome inside it was never committed. That directly
+    contradicts the promise the whole design rests on: relaunching always drops
+    him back where he was, and no outcome is ever lost.
+    """
+    p = session_path()
+    if p.exists():
+        s = _read_session(p)
+        if s:
+            return s
+    # Yesterday only. An unbounded fallback would resurrect a session a hard
+    # crash abandoned weeks ago - dropping him into a stale breather against a
+    # queue whose rows have all since been dialed - which is a worse failure
+    # than the orphaned-at-midnight one it is here to fix.
+    yesterday = session_path((date.today() - timedelta(days=1)).isoformat())
+    if yesterday.exists():
+        s = _read_session(yesterday)
+        if s:
+            print(f"resuming a session that outlived its day: {yesterday.name}", flush=True)
+            return s
+    return None
 
 
 def new_session(target: int, filters: dict, queue: list) -> dict:
@@ -175,12 +214,28 @@ def public_session() -> dict:
         "pause_used": s["pause_used"],
         "pause_remaining": max(0.0, (s["pause_until"] or 0) - now) if s["pause_until"] else 0,
         "current_call": s["current_call"],
+        # Why the tally screen is showing. "Done, 20 of 20" and "the list ran
+        # dry at 11 of 20" are different mornings and used to look identical.
+        "queue_exhausted": bool(s.get("queue_exhausted")),
+        "past_cutoff": bool(s.get("past_cutoff")),
         "pending_outcome": s.get("pending_outcome"),
         "abandon_sentence": abandon_sentence(),
         "dry_run": DRY_RUN,
         "armed": ARM_WRITE,
         "max_dials": MAX_DIALS_PER_SESSION,
     }
+
+
+def _as_int(value, default: int) -> int:
+    """int() on a JSON body field, without letting a null or a string 500 it.
+
+    `body.get("target", 20)` only defaults when the key is ABSENT - an explicit
+    {"target": null} reached int(None) and raised inside the request handler.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def abandon_sentence() -> str:
@@ -247,6 +302,47 @@ def warmup_window_error() -> dict:
 def no_store(resp):
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+# Content types a cross-origin <form> can send without triggering a preflight.
+# application/json is not one of them, which is what makes requiring it a real
+# gate rather than a decoration.
+_JSON = "application/json"
+
+
+@app.before_request
+def same_origin_only():
+    """Binding 127.0.0.1 keeps the network out. It does not keep websites out.
+
+    Every browser on this Mac can reach localhost, and a cross-origin form POST
+    is a "simple request": it is sent, and only the *response* is hidden by the
+    same-origin policy. The side effects land. So any page he has open in
+    another tab could POST /api/session and start a session, POST /api/dial and
+    spend attempts on real prospects at $0.013 a minute, or POST /api/abandon
+    and end a block mid-call. Nothing here authenticated anything.
+
+    Two gates, both of which the real window already passes:
+      1. state-changing /api calls must be application/json - a content type a
+         cross-origin form cannot produce without a preflight it would fail.
+      2. when the browser volunteers where the request came from, believe it.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    if not request.path.startswith("/api/"):
+        return None
+
+    site = request.headers.get("Sec-Fetch-Site")
+    if site and site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site request refused"}), 403
+
+    origin = request.headers.get("Origin")
+    if origin and urlparse(origin).hostname not in ("localhost", "127.0.0.1"):
+        return jsonify({"error": "cross-origin request refused"}), 403
+
+    ctype = (request.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if ctype != _JSON:
+        return jsonify({"error": f"expected {_JSON}"}), 415
+    return None
 
 
 @app.get("/")
@@ -318,6 +414,10 @@ def config():
         "default_pile": DEFAULT_PILE,
         "pause_max": PAUSE_MAX_SECONDS,
         "last_abandon": last_abandon(),
+        # Outcomes the retry queue eventually gave up on. Non-zero means a call
+        # he made is not in Airtable, so it has to be visible in the window
+        # rather than buried in a log line he will never read.
+        "dropped_writes": _air.dropped_count() if _air else 0,
     })
 
 
@@ -335,7 +435,7 @@ def token():
 
 @app.get("/api/queue")
 def queue():
-    limit = min(int(request.args.get("limit", 25)), 200)
+    limit = max(1, min(_as_int(request.args.get("limit", 25), 25), 200))
     industry = request.args.get("industry") or None
     pile = request.args.get("pile") or None
     try:
@@ -363,7 +463,7 @@ def start_session():
             return jsonify(window_error()), 403
         if not in_call_window(time.time() + WARMUP_SECONDS):
             return jsonify(warmup_window_error()), 403
-        target = max(1, min(int(body.get("target", 20)), MAX_DIALS_PER_SESSION))
+        target = max(1, min(_as_int(body.get("target", 20), 20), MAX_DIALS_PER_SESSION))
         filters = {
             "industry": body.get("industry") or None,
             "pile": body.get("pile") or DEFAULT_PILE,
@@ -411,6 +511,16 @@ def dial():
         if _session is None:
             return jsonify({"error": "no session"}), 409
         if not in_call_window():
+            # 9pm is a wall that does not reopen today, so end the session HERE
+            # rather than leaving it mid-breather. The window only showed a
+            # tally screen; the server still thought a session was running, so
+            # [DONE] answered "the session is not finished" and did nothing.
+            if _session["state"] != "TALLY":
+                _session["state"] = "TALLY"
+                _session["breather_until"] = None
+                _session["breather_seconds"] = 0
+                _session["past_cutoff"] = True
+                save_session()
             return jsonify(window_error()), 403
         # The warmup is enforced here, not only by the countdown in the window.
         # A hand-rolled POST must not be able to jump the lock-in either.
@@ -425,11 +535,31 @@ def dial():
         # tore down the call that was actually up. The state machine lives here,
         # so the refusal belongs here too - the client guards are the courtesy,
         # this is the guarantee.
-        if _session["state"] == "DIALING":
-            return jsonify({"error": "a call is already in progress"}), 409
+        #
+        # Only a live BREATHER may become a dial. The original guard named only
+        # DIALING, which let a dial through from the TALLY screen - target met,
+        # machine already finished - and spent a real attempt on a real prospect.
+        # PAUSED and DONE were the same hole.
+        if _session["state"] != "BREATHER":
+            return jsonify({
+                "error": f"a call cannot start from {_session['state']}",
+            }), 409
         if _session["dials"] >= MAX_DIALS_PER_SESSION:
             return jsonify({"error": "session dial cap reached"}), 429
+        # The cursor can sit past the end after a refill found nothing; indexing
+        # it raised IndexError -> 500, and a 500 here is a window with no way
+        # forward and no way to stop.
+        if _session["cursor"] >= len(_session["queue"]):
+            return jsonify({"error": "the queue is exhausted"}), 409
         lead = _session["queue"][_session["cursor"]]
+        # Claim the slot HERE, inside the same critical section that checked it.
+        # The DNC re-check below runs with the lock released, and the state was
+        # only set to DIALING after it came back - so two requests arriving
+        # together both saw BREATHER, both passed the guard, and both placed a
+        # call. One call at a time is not a preference: it is one of the three
+        # constraints keeping this outside the ATDS definition.
+        # (Reproduced 2026-08-05: two concurrent POSTs, two numbers, two dials.)
+        _session["state"] = "DIALING"
 
     # Hard refusal #1, second half: the queue filter can go stale between pull and
     # dial. He runs parallel Claude sessions and the SDR agent writes these rows.
@@ -437,16 +567,43 @@ def dial():
     try:
         phone = _air.assert_dialable(lead["id"])
     except Exception as e:  # noqa: BLE001
+        if not isinstance(e, DialRefused):
+            # We could not reach Airtable to ask - which is not the same as the
+            # row being refused, and must not cost him the lead. Hold the
+            # cursor, hand the client a retryable error, and let it come back
+            # to this same number in five seconds. (Treating these alike burned
+            # the whole 80-lead prefetch in seconds on a dead wifi and left the
+            # tally screen looking like a completed session.)
+            with _lock:
+                if _session is not None and _session["state"] == "DIALING":
+                    _session["state"] = "BREATHER"
+                    _session["breather_seconds"] = 0
+                    _session["breather_until"] = time.time()
+                save_session()
+            return jsonify({
+                "error": f"Airtable is unreachable, holding this number: {e}",
+                "session": public_session(),
+            }), 503
         with _lock:
-            # A refused row costs zero seconds. Straight to the next number.
-            _advance(breather_seconds=0, skip=True)
-            save_session()
+            try:
+                # A refused row costs zero seconds. Straight to the next number.
+                _advance(breather_seconds=0, skip=True)
+            finally:
+                # The DIALING claim above must come off no matter what _advance
+                # did. Leaving it set would 409 every subsequent dial for the
+                # rest of the session - a session with no way forward, which is
+                # the one state this whole machine exists to prevent.
+                if _session is not None and _session["state"] == "DIALING":
+                    _session["state"] = "BREATHER"
+                    _session["breather_seconds"] = 0
+                    _session["breather_until"] = time.time()
+                save_session()
         return jsonify({"error": str(e), "skipped": True,
                         "session": public_session()}), 200
     dnc_ms = int((time.monotonic() - t0) * 1000)
 
     with _lock:
-        _session["state"] = "DIALING"
+        # state is already DIALING - claimed above, before the lock was released.
         _session["dials"] += 1
         _session["current_call"] = {
             "lead_id": lead["id"], "phone": phone,
@@ -510,6 +667,11 @@ def breather_start():
     with _lock:
         if _session is None:
             return jsonify({"error": "no session"}), 409
+        # Same unguarded index as /api/dial had. A call that ends after the
+        # cursor ran off the end raised IndexError -> 500, and the window's
+        # endCall() has no handler for that: the loop simply stops.
+        if _session["cursor"] >= len(_session["queue"]):
+            return jsonify({"error": "the queue is exhausted"}), 409
         lead = _session["queue"][_session["cursor"]]
         _session["pending_outcome"] = {
             "record_id": lead["id"],
@@ -521,7 +683,7 @@ def breather_start():
             "next_note": None,
             "dnc": False,
         }
-        secs = BREATHER_REAL if int(body.get("breather", 0)) >= BREATHER_REAL \
+        secs = BREATHER_REAL if _as_int(body.get("breather", 0), 0) >= BREATHER_REAL \
             else BREATHER_DEAD_END
         _session["state"] = "BREATHER"
         _session["breather_seconds"] = secs
@@ -548,7 +710,23 @@ def breather_update():
                 # unless he has already typed one himself.
                 p["next_action"] = outcomes.default_next_action(d)
             p["disposition"] = d
-        for k in ("note", "next_action", "next_note"):
+        if "next_action" in body:
+            # Validate HERE, not at commit. This field is free text from the
+            # breather panel, and resolve_next_action() raises on garbage. Left
+            # unchecked it raised inside build_payload() at commit time - after
+            # pending_outcome had already been cleared - which 500'd /api/outcome
+            # and destroyed a real call's outcome: the disposition was gone, the
+            # cursor never advanced, and the client re-dialed the same lead.
+            # Refusing the keystroke costs him a retype; refusing at commit cost
+            # him the call. (Reproduced 2026-08-05 with "next tuesday".)
+            raw = body["next_action"] or None
+            if raw:
+                try:
+                    raw = outcomes.resolve_next_action(raw)
+                except ValueError as e:
+                    return jsonify({"error": str(e)}), 400
+            p["next_action"] = raw
+        for k in ("note", "next_note"):
             if k in body:
                 p[k] = body[k] or None
         if "dnc" in body:
@@ -570,11 +748,31 @@ def _commit_pending() -> dict | None:
         return None
     s["pending_outcome"] = None
 
-    result = _air.log_outcome(
-        p["record_id"], p["disposition"], note=p.get("note"),
-        next_action=p.get("next_action"), next_note=p.get("next_note"),
-        dnc=p.get("dnc", False),
-    )
+    # log_outcome() is contracted never to raise - a failed write queues itself.
+    # This catch is for the contract being broken anyway, which it was: a bad
+    # follow-up date escaped build_payload() as a ValueError and took the whole
+    # commit with it. The dial is the thing that must survive. Counting it and
+    # moving on is strictly better than 500-ing and stranding the session, so
+    # nothing below this line may re-raise.
+    try:
+        result = _air.log_outcome(
+            p["record_id"], p["disposition"], note=p.get("note"),
+            next_action=p.get("next_action"), next_note=p.get("next_note"),
+            dnc=p.get("dnc", False),
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[commit failed, dial still counted] {p.get('company')}: {e}", flush=True)
+        result = {"ok": False, "armed": ARM_WRITE, "queued": False, "error": str(e)}
+
+    # Persist the CLEARED pending outcome the instant the write lands, before
+    # touching any counter. Every caller used to save well after this point -
+    # outcome() after _advance(), bootstrap() sixty lines later, abandon() after
+    # the jsonl append - so a kill anywhere in that window left a file still
+    # holding the outcome we just PATCHed. The next boot's orphan-commit saw it,
+    # wrote it AGAIN, and build_payload() re-read the live row: Attempts +2 for
+    # one dial, the Notes marker twice, and the 4-attempt retirement able to
+    # close a row after two real calls.
+    save_session()
 
     s["completed"] += 1
     if p["disposition"] in ("Conversation", "Busy, Call Back", "Meeting Booked"):
@@ -614,21 +812,40 @@ def _advance(breather_seconds: int = BREATHER_DEAD_END, skip: bool = False) -> N
         s["state"] = "TALLY"
         s["breather_until"] = None
         s["breather_seconds"] = 0
+        # Drop it here too, or a pause asked for during the last call of a
+        # session survives the tally and fires unrequested on the first dial
+        # after [ANOTHER 10].
+        s.pop("pause_requested", None)
         return
     if s["cursor"] >= len(s["queue"]):
         try:
+            # timeout=5, not the default 30: this runs INSIDE the global lock,
+            # so every other endpoint - the countdown, a keypress, the abandon
+            # panel - is blocked for exactly as long as it takes. At the default
+            # a flaky refill froze the whole app for ~90s across the retries.
             more = _air.fetch_queue(QUEUE_PREFETCH, s["filters"].get("industry"),
-                                    s["filters"].get("pile"))
+                                    s["filters"].get("pile"), timeout=5)
             seen = {l["id"] for l in s["queue"]}
             s["queue"].extend([l for l in more if l["id"] not in seen])
         except Exception as e:  # noqa: BLE001
             print(f"[queue refill failed] {e}")
     if s["cursor"] >= len(s["queue"]):
         s["state"] = "TALLY"
+        s["queue_exhausted"] = True   # tally must say "list ran dry", not "done"
+        s.pop("pause_requested", None)
         return
     s["state"] = "BREATHER"
     s["breather_seconds"] = breather_seconds
     s["breather_until"] = time.time() + breather_seconds
+
+    # Cash in a pause that was asked for mid-call. /api/pause answers "pause
+    # starts after this call" and set this flag - and nothing anywhere read it,
+    # so the pause never came. A machine built on being trusted to keep going
+    # cannot also quietly break the one promise it makes about stopping.
+    if s.pop("pause_requested", False) and not s["pause_used"]:
+        s["pause_used"] = True
+        s["pause_until"] = time.time() + PAUSE_MAX_SECONDS
+        s["state"] = "PAUSED"
 
 
 @app.post("/api/breather/hold")
@@ -668,14 +885,21 @@ def pause():
             # real pause he gets for the calls themselves.
             return jsonify({"ok": False,
                             "message": "the warmup is already the break"}), 200
+        if _session["pause_used"]:
+            # Checked BEFORE the deferred branch. The other order answered
+            # "pause starts after this call" on a session whose one pause was
+            # already spent, and then no pause came - the machine breaking the
+            # only promise it makes about stopping.
+            return jsonify({"ok": False, "message": "no pauses left"}), 200
         if _session["state"] == "DIALING":
             # Nothing to pause on a live call. Take effect after the hangup.
             _session["pause_requested"] = True
             save_session()
             return jsonify({"ok": True, "deferred": True,
                             "message": "pause starts after this call"})
-        if _session["pause_used"]:
-            return jsonify({"ok": False, "message": "no pauses left"}), 200
+        if _session["state"] not in ("BREATHER", "PAUSED"):
+            return jsonify({"ok": False,
+                            "message": f"nothing to pause from {_session['state']}"}), 200
         _session["pause_used"] = True
         _session["pause_until"] = time.time() + PAUSE_MAX_SECONDS
         _session["state"] = "PAUSED"
@@ -689,6 +913,12 @@ def pause_resume():
     with _lock:
         if _session is None:
             return jsonify({"error": "no session"}), 409
+        # Only a pause can be resumed. This transitioned unconditionally, so an
+        # ENTER that arrived while a call was live dropped the session out of
+        # DIALING into a zero-length breather - which is a dial placed on top of
+        # the call that was already up.
+        if _session["state"] != "PAUSED":
+            return jsonify({"ok": False, "session": public_session()})
         _session["pause_until"] = None
         _session["state"] = "BREATHER"
         _session["breather_seconds"] = 0
@@ -704,7 +934,11 @@ def another():
     with _lock:
         if _session is None:
             return jsonify({"error": "no session"}), 409
-        _session["target"] += max(1, min(int(body.get("count", 10)),
+        if _session["state"] != "TALLY":
+            # It is a tally-screen button. Reachable mid-call it raised the
+            # target and forced a BREATHER on top of a live call.
+            return jsonify({"error": "the session is not finished"}), 403
+        _session["target"] += max(1, min(_as_int(body.get("count", 10), 10),
                                          MAX_DIALS_PER_SESSION))
         _session["state"] = "BREATHER"
         _session["breather_seconds"] = 0
@@ -743,17 +977,28 @@ def abandon():
         expected = abandon_sentence()
         if typed.strip() != expected:
             return jsonify({"ok": False, "expected": expected}), 400
-        # Abandoning the session must not also lose the last call's outcome.
-        _commit_pending()
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with (STATE_DIR / "abandons.jsonl").open("a") as fh:
-            fh.write(json.dumps({
-                "ts": datetime.now().isoformat(timespec="seconds"),
-                "session_id": _session["id"],
-                "completed": _session["completed"],
-                "target": _session["target"],
-                "dials": _session["dials"],
-            }) + "\n")
+        # Abandoning the session must not also lose the last call's outcome -
+        # and it must not be BLOCKED by one either. The typed sentence is the
+        # only graceful exit in the whole app; if Airtable is down, "I am
+        # quitting at 8 of 20" cannot be the thing that 500s. Commit if we can,
+        # leave and record either way.
+        try:
+            _commit_pending()
+        except Exception as e:  # noqa: BLE001
+            print(f"[abandon: commit failed, leaving anyway] {e}", flush=True)
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with (STATE_DIR / "abandons.jsonl").open("a") as fh:
+                fh.write(json.dumps({
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "session_id": _session["id"],
+                    "completed": _session["completed"],
+                    "target": _session["target"],
+                    "dials": _session["dials"],
+                }) + "\n")
+        except Exception as e:  # noqa: BLE001
+            # Recording the abandon must never be able to block the abandon.
+            print(f"[abandon not recorded] {e}", flush=True)
         _session["abandoned"] = True
         _session["state"] = "DONE"
         save_session()
@@ -768,8 +1013,40 @@ def pending():
 
 # --- startup -----------------------------------------------------------------
 
+def _refuse_second_instance() -> None:
+    """Exit if another server already owns this port.
+
+    bootstrap() below auto-commits any `pending_outcome` it finds on disk,
+    treating it as an orphan left by a dead process. But the RUNNING process
+    parks an outcome there for the whole of every breather - that is the point
+    of holding it server-side. So a second `./run.sh` (a documented entry point,
+    and he runs parallel Claude sessions) would read the live session file,
+    PATCH that outcome to Airtable itself, and only THEN die on the port bind.
+    The first process commits the same call again when its breather ends:
+    Attempts +2 for one dial, a duplicated Notes line, and the 4-attempt
+    retirement able to fire a call early - permanent wrong writes to the CRM
+    every other AIOS tool trusts.
+
+    Only the packaged launcher checked for this, via its own curl; run.sh and a
+    bare `python3 server.py` went straight through. The guard belongs here, so
+    it covers every entry point.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.4)
+        if s.connect_ex((BIND, PORT)) == 0:
+            print(f"\nA No Brakes server is already running on {BIND}:{PORT}.\n"
+                  "Not starting a second one - it would re-commit the running "
+                  "session's parked outcome to Airtable.\n"
+                  "Use the window that is already open, or quit it first.\n",
+                  file=sys.stderr)
+            sys.exit(1)
+
+
 def bootstrap() -> None:
     global _air, _twilio, _session
+    _refuse_second_instance()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     _air = AirtableClient()
@@ -781,8 +1058,19 @@ def bootstrap() -> None:
     def _keep_airtable_warm():
         while True:
             time.sleep(45)
-            if _session is not None and _session.get("state") != "TALLY":
-                _air.warm()
+            try:
+                # Read the global ONCE. `_session is not None` and
+                # `_session.get(...)` were two separate global lookups, and
+                # /api/done and /api/abandon reassign it to None - land between
+                # them and this raised AttributeError, which ended the thread
+                # for the rest of the process's life. Silently: the only trace
+                # was a traceback in the log, and every later DNC re-check paid
+                # a cold TLS handshake on the dial path forever after.
+                s = _session
+                if s is not None and s.get("state") != "TALLY":
+                    _air.warm()
+            except Exception as e:  # noqa: BLE001
+                print(f"[warm thread] {e}", flush=True)
     threading.Thread(target=_keep_airtable_warm, daemon=True).start()
 
     if DRY_RUN:
@@ -860,7 +1148,10 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _shutdown)
     try:
         bootstrap()
-    except TwilioConfigError as e:
+    except (TwilioConfigError, AirtableError) as e:
+        # AirtableError was not caught here, so a missing .env or a blank
+        # AIRTABLE_API_KEY crashed with a raw traceback instead of the same
+        # clean one-line explanation every Twilio misconfiguration gets.
         print(f"\n{e}\n", file=sys.stderr)
         sys.exit(1)
     app.run(host=BIND, port=PORT, threaded=True, debug=False, use_reloader=False)
