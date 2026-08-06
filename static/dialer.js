@@ -502,6 +502,14 @@ async function dialNext() {
        So: no outcome, no advance, no attempt spent. Hold this lead, say so,
        and come back to the same number. */
     S.setupFails = (S.setupFails || 0) + 1;
+    // Report what this dial paid before giving up on it. Every other exit from a
+    // dial flushes - accept, early media, endCall - but this one did not, so the
+    // single failure mode most worth diagnosing was also the only one that
+    // produced no 'dial timing' line at all. The marks tell us WHERE setup died:
+    // an api_dial with no 'device' is a token or registration problem, a 'device'
+    // with no 'connect' is the SDK, and neither is guessable after the fact.
+    timingMark('setup_failed');
+    timingFlush('setup-failed:' + (e.name || 'error'));
     setDialState('could not place the call', 'failed');
     banner(S.setupFails >= 3
       ? 'Cannot place calls: ' + (e.message || e) + ' — nothing is being written to Airtable'

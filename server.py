@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -507,7 +507,16 @@ def warmup_done():
 @app.post("/api/dial")
 def dial():
     """Called just before device.connect(). Re-checks DNC on the live row."""
+    # Time spent BLOCKED on the global lock, before this request does any work of
+    # its own. Nothing measured this, and it is the one cost the [dial] line below
+    # could not previously explain: /api/outcome holds this same lock across its
+    # whole Airtable round-trip (measured 2026-08-05 at 162.8ms median, 213.6ms
+    # max, ~60% of all lock-hold in the app), so a dial arriving on top of a commit
+    # waits it out with nothing to show for it. Without this number a slow dial is
+    # indistinguishable from a slow DNC check, and the fix for each is different.
+    _t_lock1 = time.monotonic()
     with _lock:
+        lock1_ms = int((time.monotonic() - _t_lock1) * 1000)
         if _session is None:
             return jsonify({"error": "no session"}), 409
         if not in_call_window():
@@ -602,7 +611,9 @@ def dial():
                         "session": public_session()}), 200
     dnc_ms = int((time.monotonic() - t0) * 1000)
 
+    _t_lock2 = time.monotonic()
     with _lock:
+        lock2_ms = int((time.monotonic() - _t_lock2) * 1000)
         # state is already DIALING - claimed above, before the lock was released.
         _session["dials"] += 1
         _session["current_call"] = {
@@ -611,9 +622,12 @@ def dial():
         }
         t1 = time.monotonic()
         save_session()
-        # The two serial costs standing between "go" and the browser holding a
-        # phone number. Everything after this line is Twilio's side of the gap.
-        print(f"{datetime.now():%H:%M:%S} [dial] dnc_check={dnc_ms}ms "
+        # Every serial cost standing between "go" and the browser holding a phone
+        # number. Everything after this line is Twilio's side of the gap.
+        # lock1/lock2 are contention, dnc_check is Airtable, save_session is disk -
+        # three different problems with three different fixes, so name them apart.
+        print(f"{datetime.now():%H:%M:%S} [dial] lock_wait={lock1_ms + lock2_ms}ms "
+              f"(pre={lock1_ms} post={lock2_ms}) dnc_check={dnc_ms}ms "
               f"save_session={int((time.monotonic() - t1) * 1000)}ms", flush=True)
         return jsonify({"phone": phone, "lead": lead, "session": public_session()})
 
@@ -637,11 +651,52 @@ def call_status():
     if DRY_RUN or _twilio is None:
         return jsonify({"dry_run": True})
     try:
-        return jsonify(_twilio.call_status(sid))
+        st = _twilio.call_status(sid)
+        _log_carrier_segment(sid, st)
+        return jsonify(st)
     except Exception as e:  # noqa: BLE001
         # A polling failure must never stop the machine.
         return jsonify({"status": "unknown", "connected": False,
                         "finished": False, "error": str(e)})
+
+
+_carrier_logged: set[str] = set()
+
+
+def _log_carrier_segment(parent_sid: str, st: dict) -> None:
+    """Time the one segment of go-to-audible that nothing measured.
+
+    The client marks the gap up to device.connect() and again at accept, but
+    everything between - WebRTC signalling, the Twilio Function, and the carrier
+    actually creating the leg to the lead - was a black box. The child call's own
+    start_time closes it, and child_call() already fetches that field on every
+    poll, so this costs no extra Twilio round-trip.
+
+    Logged once per call. Never raises: this is a diagnostic riding on the poll
+    that keeps the loop alive, and a bad timestamp must not cost a dial.
+    """
+    try:
+        started = st.get("child_start_time")
+        if not started or parent_sid in _carrier_logged:
+            return
+        s = _session
+        cc = (s or {}).get("current_call") or {}
+        if cc.get("parent_sid") != parent_sid or not cc.get("started_at"):
+            return
+        _carrier_logged.add(parent_sid)
+        child_dt = datetime.fromisoformat(started)
+        # Twilio hands back tz-aware UTC and isoformat() keeps the offset (checked
+        # against the installed SDK). If that ever stops being true, .timestamp()
+        # on a naive value would silently read it as LOCAL and report the carrier
+        # segment 7 hours out - a wrong number is worse than no number here.
+        if child_dt.tzinfo is None:
+            child_dt = child_dt.replace(tzinfo=timezone.utc)
+        child_epoch = child_dt.timestamp()
+        print(f"{datetime.now():%H:%M:%S} [carrier] dial->child_leg="
+              f"{int((child_epoch - cc['started_at']) * 1000)}ms "
+              f"child={st.get('child')}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[carrier timing skipped] {e}", flush=True)
 
 
 @app.post("/api/hangup")

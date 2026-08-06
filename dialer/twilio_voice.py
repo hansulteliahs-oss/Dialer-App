@@ -237,6 +237,10 @@ class TwilioVoice:
             "duration": child["duration"],
             "connected": child["status"] == "in-progress" or child["duration"] > 0,
             "finished": child["status"] in TERMINAL_STATES,
+            # Carried through purely so the server can time the carrier segment.
+            # child_call() already pays for this field on every poll; dropping it
+            # here is what left connect -> audible a black box. Costs nothing.
+            "child_start_time": child["start_time"],
         }
 
     def hangup(self, call_sid: str) -> dict:
