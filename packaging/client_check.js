@@ -45,6 +45,14 @@ function check(label, fn) {
 
 // --- DOM stub ----------------------------------------------------------------
 
+/* Which element has focus. The stub used to expose `activeElement: null` and a
+   no-op focus(), so `document.activeElement === $('note')` was permanently
+   false in here and permanently TRUE in a real browser - the harness modelled
+   the exact opposite of the thing under test, and passed while 1-5, D and P
+   were dead on the keyboard for every breather. A stub that lies about focus
+   cannot test a keyboard. */
+let FOCUSED = null;
+
 function makeEl(id) {
   const handlers = {};
   const el = {
@@ -57,7 +65,8 @@ function makeEl(id) {
       toggle(c, on) { on === undefined ? (this._s.has(c) ? this._s.delete(c) : this._s.add(c))
                                        : (on ? this._s.add(c) : this._s.delete(c)); },
     },
-    focus() {}, blur() {}, preventDefault() {},
+    focus() { FOCUSED = el; }, blur() { if (FOCUSED === el) FOCUSED = null; },
+    preventDefault() {},
     addEventListener(ev, fn) { (handlers[ev] = handlers[ev] || []).push(fn); },
     removeEventListener() {},
     fire(ev, arg) { (handlers[ev] || []).forEach(f => f(arg)); },
@@ -71,6 +80,7 @@ function makeEl(id) {
 // --- the sandbox -------------------------------------------------------------
 
 function boot(opts = {}) {
+  FOCUSED = null;          // each test starts with nothing focused
   const els = {};
   const $ = id => (els[id] = els[id] || makeEl(id));
 
@@ -112,6 +122,10 @@ function boot(opts = {}) {
     fetch: fetchStub,
     JSON, Math, String, Number, Object, Array, Promise, Set, Map, Error, isNaN,
     parseInt, parseFloat, encodeURIComponent,
+    // api() gives every request a deadline. The abort never fires here (the
+    // fake clock does not drive real timers into the stub), but the class has
+    // to exist or every single request throws before it is sent.
+    AbortController,
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
@@ -149,7 +163,7 @@ function boot(opts = {}) {
     createElement: () => makeEl('new'),
     addEventListener(ev, fn) { (this._h[ev] = this._h[ev] || []).push(fn); },
     querySelectorAll: () => [],
-    activeElement: null,
+    get activeElement() { return FOCUSED; },
     _h: {},
   };
   sandbox.Twilio = {Device: function () { throw new Error('unused'); }};
@@ -358,15 +372,25 @@ async function main() {
       assert.strictEqual(starts.length, 1, `${starts.length} breathers started for one call`));
   }
 
-  console.log('\n=== 6. a failed dial still recovers into a breather ===');
+  console.log('\n=== 6. a dial that never reached Twilio writes nothing, and keeps trying ===');
   {
-    // The teardown latch must not stay shut from the previous call. If it does,
-    // one failed /api/dial ends the session silently: no breather, no countdown,
-    // no next number, and a window that just sits there looking like it is
-    // waiting on him.
+    /* This used to assert the opposite - that a throwing dial still opened a
+       breather. It does not any more, and the old expectation was the bug.
+
+       Opening a breather PARKS A DISPOSITION. endCall() derives it from
+       connectedSecs alone, which is zero when device.connect() threw, so the
+       parked outcome was "No Answer" - written to Airtable with Attempts +1 and
+       Last Call Date = today for a lead whose phone never rang. The realistic
+       cause is the vendored SDK failing to load (a plain <script> tag, no
+       onerror), which throws identically on EVERY lead: a 20-dial session
+       marks 20 uncalled leads as no-answers, and outcomes.py retires any that
+       reach four attempts. Permanently, on a morning nothing was dialled.
+
+       So the contract is now: no call placed -> no outcome, no attempt spent,
+       hold the lead and come back to it. */
     const h = boot({routes: {'/api/dial': () => { throw new Error('network down'); }}});
     await flush(); await flush();
-    const call = liveCall(h);
+    liveCall(h);
     const S = h.nb().S;
 
     await h.nb().endCall('remote');     // previous call ends, latch shuts
@@ -376,12 +400,67 @@ async function main() {
     const before = h.calls.length;
 
     await h.nb().dialNext();            // this throws inside
-    await h.advance(8000);              // past the catch's teardown timer
+    await h.advance(12000);             // past the retry backoff
 
-    const starts = h.calls.slice(before).filter(c => c.path === '/api/breather/start');
-    check('a dial that throws still starts the next breather', () =>
-      assert.strictEqual(starts.length, 1,
-        'the loop stalled - no breather after a failed dial'));
+    const after = h.calls.slice(before);
+    check('a dial that never reached Twilio parks no outcome', () =>
+      assert.strictEqual(after.filter(c => c.path === '/api/breather/start').length, 0,
+        'a lead that was never called got a disposition parked for it'));
+    check('...and the loop keeps trying rather than stalling', () =>
+      assert.ok(after.filter(c => c.path === '/api/dial').length >= 2,
+        'the loop stalled - it never came back to the number'));
+  }
+
+  console.log('\n=== 6b. the documented breather keys are live on the keyboard ===');
+  {
+    /* startBreather() focuses the note and nothing blurs it, so `typing` was
+       true for the whole breather and the 1-5 / D / P branches never ran.
+       Every one of those keys is documented as live during every breather; all
+       three were dead, in an app whose entire premise is not touching the
+       mouse. The stub models focus faithfully so this can be caught here. */
+    const h = boot();
+    await flush(); await flush();
+    const S = h.nb().S;
+    S.cfg = CFG;
+    S.session = SESSION('BREATHER');
+    S.breatherEndsAt = h.now() + 15000;
+    // makeEl defaults hidden:false, so the key handler's first two guards read
+    // as "the resume gate is up" and "the abandon panel is open" and swallow
+    // everything. Both are closed during a real breather.
+    h.sandbox.document.getElementById('resume-gate').hidden = true;
+    h.sandbox.document.getElementById('abandon-panel').hidden = true;
+
+    h.nb().startBreather();            // focuses the note, exactly like a real breather
+    await flush();
+    const before = h.calls.length;
+
+    const press = key => (h.sandbox.document._h.keydown || [])
+      .forEach(fn => fn({key, shiftKey: false, repeat: false, preventDefault() {}}));
+
+    press('2');                        // a disposition key
+    await flush(); await flush();
+    const updates = h.calls.slice(before).filter(c => c.path === '/api/breather/update');
+    check('a number key sets the disposition while the note has focus but is empty', () =>
+      assert.ok(updates.some(c => c.body && c.body.disposition),
+        'the number key was swallowed by the focused note'));
+
+    const beforeD = h.calls.length;
+    press('d');
+    await flush(); await flush();
+    check('D reaches do-not-call', () =>
+      assert.ok(h.calls.slice(beforeD).some(c => c.path === '/api/breather/update'
+                                             && c.body && 'dnc' in c.body),
+        'D was swallowed by the focused note'));
+
+    // ...and once he is actually writing, the note gets its own keys back.
+    h.els.note.value = 'called back monday';
+    const beforeTyped = h.calls.length;
+    press('2');
+    await flush(); await flush();
+    check('a number key is literal once a note has been started', () =>
+      assert.strictEqual(h.calls.slice(beforeTyped)
+        .filter(c => c.path === '/api/breather/update').length, 0,
+        'the key stole a character out of a real note'));
   }
 
   console.log('\n=== 7. one ENTER is one commit ===');

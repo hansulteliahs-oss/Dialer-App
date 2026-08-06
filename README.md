@@ -302,7 +302,7 @@ Every non-terminal disposition writes `Status = Snoozed` with a future
 ```
 Busy, Call Back    -> Status=Snoozed  Next Action=+3d
 Conversation       -> Status=Snoozed  Next Action=+7d
-No Answer          -> Status=Snoozed  Next Action=+1d
+No Answer          -> Status=Snoozed  Next Action=+2d
 ```
 
 **Nothing anywhere flips `Snoozed` back when that date arrives.**
@@ -394,8 +394,22 @@ behaviour.
 
 `static/playbook.js` is the second copy of the same kind of problem: every line
 in it is a compression of `references/cold-call-playbook.md` in the AIOS repo.
-Change that file's four beats or its eight objections and this one has to move
-with it, by hand, in the other repo. Nothing checks.
+Change that file's four beats or its objections and this one has to move with
+it, by hand, in the other repo.
+
+**Something checks now.** `packaging/drift_check.py` reads both repos and
+fails on divergence — the five Disposition options, the promise/terminal sets,
+the retry offsets, `plan_followup()` over a matrix of inputs, the two
+*deliberate* divergences still being exactly those two, the live Airtable
+schema still matching what `outcomes.py` will write, and every objection in the
+playbook markdown still being carried on screen:
+
+```bash
+./.venv/bin/python3 packaging/drift_check.py     # 29 checks, no server needed
+```
+
+It skips with exit 0 if the AIOS repo isn't on the machine, so a clone
+elsewhere still runs its own tests.
 
 ---
 
