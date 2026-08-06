@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 
+from twilio.http.http_client import TwilioHttpClient
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.rest import Client
@@ -40,6 +42,15 @@ TERMINAL_STATES = {"completed", "busy", "no-answer", "failed", "canceled"}
 
 # Access tokens have no default TTL and max out at 24h. Set it explicitly.
 TOKEN_TTL_SECONDS = 3600
+
+# TwilioHttpClient defaults to timeout=None, which requests/urllib3 read as
+# "wait forever". A silent black-hole connection - captive-portal wifi, a
+# half-open VPN - therefore hangs preflight() before app.run() ever executes,
+# and the port never opens: launched from run.sh there is no watchdog at all,
+# so the process just sits there. airtable.py already learned this lesson on
+# the dial path ("30s each meant a flaky patch could hold a dial hostage for a
+# minute and a half"); the same discipline belongs here.
+HTTP_TIMEOUT_SECONDS = 10
 
 
 class TwilioConfigError(RuntimeError):
@@ -59,7 +70,17 @@ class TwilioVoice:
         self.twiml_app_sid = twiml_app_sid or os.environ.get("TWILIO_TWIML_APP_SID", "")
         self.caller_id = (caller_id or os.environ.get("TWILIO_CALLER_ID", "")).strip()
         self.validate()
-        self._client = Client(self.api_key, self.api_secret, self.account_sid)
+        self._client = self._new_client()
+        # call_status() and hangup() are hit from concurrent Flask request
+        # threads (the client polls every 1.2s). preflight() already notes that
+        # the SDK's underlying requests.Session "is not promised thread-safe"
+        # and hands each worker its own Client - the shared one used for the
+        # rest of the session's life needs the same protection, so serialise it.
+        self._client_lock = threading.Lock()
+
+    def _new_client(self) -> Client:
+        return Client(self.api_key, self.api_secret, self.account_sid,
+                      http_client=TwilioHttpClient(timeout=HTTP_TIMEOUT_SECONDS))
 
     # --- startup guards ------------------------------------------------------
 
@@ -102,22 +123,33 @@ class TwilioVoice:
         """
         from concurrent.futures import ThreadPoolExecutor
 
-        def fresh():
-            return Client(self.api_key, self.api_secret, self.account_sid)
+        fresh = self._new_client
 
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            f_acct = pool.submit(lambda: fresh().api.accounts(self.account_sid).fetch())
-            f_verified = pool.submit(lambda: [c.phone_number
-                                              for c in fresh().outgoing_caller_ids.list()])
-            f_owned = pool.submit(lambda: [n.phone_number
-                                           for n in fresh().incoming_phone_numbers.list()])
-            f_app = pool.submit(lambda: fresh().applications(self.twiml_app_sid).fetch())
-            f_balance = pool.submit(lambda: fresh().balance.fetch().balance)
-            acct = f_acct.result()
-            verified = f_verified.result()
-            owned = f_owned.result()
-            app = f_app.result()
-            balance = f_balance.result()
+        try:
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                f_acct = pool.submit(lambda: fresh().api.accounts(self.account_sid).fetch())
+                f_verified = pool.submit(lambda: [c.phone_number
+                                                  for c in fresh().outgoing_caller_ids.list()])
+                f_owned = pool.submit(lambda: [n.phone_number
+                                               for n in fresh().incoming_phone_numbers.list()])
+                f_app = pool.submit(lambda: fresh().applications(self.twiml_app_sid).fetch())
+                f_balance = pool.submit(lambda: fresh().balance.fetch().balance)
+                acct = f_acct.result()
+                verified = f_verified.result()
+                owned = f_owned.result()
+                app = f_app.result()
+                balance = f_balance.result()
+        except TwilioConfigError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # Only TwilioConfigError is caught at the top-level startup guard,
+            # so a transient Twilio 500 or an unreachable API used to crash the
+            # launch with a raw traceback - on a morning he is trying to dial,
+            # reading as "what did I break" rather than "try again in a minute".
+            raise TwilioConfigError(
+                f"Could not reach Twilio to verify the account ({e}). "
+                "This is almost always a network blip - try launching again."
+            ) from e
 
         if acct.type != "Full":
             raise TwilioConfigError(
@@ -164,7 +196,8 @@ class TwilioVoice:
         The browser's own call is the PARENT; <Dial> creates a CHILD leg to the
         prospect. Status and duration that matter are the child's.
         """
-        kids = self._client.calls.list(parent_call_sid=parent_call_sid, limit=1)
+        with self._client_lock:
+            kids = self._client.calls.list(parent_call_sid=parent_call_sid, limit=1)
         if not kids:
             return None
         c = kids[0]
@@ -188,7 +221,8 @@ class TwilioVoice:
         child = self.child_call(parent_call_sid)
         if child is None:
             try:
-                parent = self._client.calls(parent_call_sid).fetch()
+                with self._client_lock:
+                    parent = self._client.calls(parent_call_sid).fetch()
                 pstatus = parent.status
             except Exception:  # noqa: BLE001
                 pstatus = "unknown"
@@ -213,7 +247,8 @@ class TwilioVoice:
         wrong one for the state is a documented Twilio failure, so fetch first.
         """
         try:
-            call = self._client.calls(call_sid).fetch()
+            with self._client_lock:
+                call = self._client.calls(call_sid).fetch()
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"fetch failed: {e}"}
 
@@ -221,7 +256,8 @@ class TwilioVoice:
             return {"ok": True, "status": call.status, "action": "already-ended"}
         target = "canceled" if call.status in PRE_ANSWER_STATES else "completed"
         try:
-            updated = self._client.calls(call_sid).update(status=target)
+            with self._client_lock:
+                updated = self._client.calls(call_sid).update(status=target)
             return {"ok": True, "status": updated.status, "action": target}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e), "attempted": target}
