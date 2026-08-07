@@ -74,5 +74,9 @@ window.PLAYBOOK = {
      'Be direct. Eliahs Hansult from Handled, I work with shops your size on lost jobs from missed calls, and I got your name from a public business database. If you’d rather not be contacted I can take you off right now.'],
     ['"Take me off your list."',
      'Honor it on the spot, no rebuttal, no last pitch. "Understood, I’ll take you off right now. Sorry for the bother." End the call and press D — that sets the DNC box, which is the deny-trail nothing will ever restage.'],
+    // TRACK 3 only (2+ no-answers on file). Rare, so it stays out of the rail,
+    // but it is the one objection that decides that whole call.
+    ['"You’re a salesman, that’s different."',
+     'Concede it fully, then reframe — do not argue the premise, he is right. Totally, and you should ignore me. But your phone can’t tell us apart: same unknown number as the homeowner whose AC died at 7pm. Never mention the voicemail, that hands him "I could tell it was a sales call."'],
   ],
 };
