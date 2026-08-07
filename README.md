@@ -101,6 +101,15 @@ actually ends the session.**
    *(Verified: 2 of 20 → `kill -9` → relaunched at 3 of 20, parked outcome written.)*
    The same is true of the 5:00 warmup: its deadline is a timestamp, not a timer,
    so quitting through it neither skips it nor restarts it.
+
+   The no-fresh-slate rule is **same-day, plus anything still live**. A session
+   that outlived midnight comes back only if it has real work left in it: a
+   parked outcome, a call in flight, or a warmup/breather/pause whose deadline
+   has not passed. One left inert is retired on the next boot and written to
+   `abandons.jsonl` as the abandon it always was. Without that boundary a
+   session quit at 2 of 5 yesterday hijacks this morning's start screen and,
+   because its breather expired overnight, **dials on boot with no lock-in** —
+   the precise opposite of what the warmup exists for.
 3. **Typing is the only graceful exit.** Hold `ESC` for 2s, then type
    `I am quitting at 8 of 20 with 12 calls left` verbatim. Paste is blocked.
 4. **Abandonment is recorded** to `state/abandons.jsonl` and shown on the start
@@ -462,6 +471,7 @@ and stays.
 | Twilio dial errors | 5s pause, `Attempts` **not** incremented, advance |
 | Mic permission lost | loud banner, queue keeps advancing |
 | Server/tab crash | `state/session-{date}.json` resumes mid-list; parked outcome committed on boot |
+| Session outlived midnight | resumes only if it still has live work; otherwise retired and recorded as abandoned |
 | Runaway loop | hard cap of 60 dials per session (cost guard) |
 | Outside 8am–9pm | dialing refused (legal line) |
 | Warmup would end after 9pm | START refused — the lock-in never runs toward a wall |

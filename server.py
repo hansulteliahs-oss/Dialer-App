@@ -119,15 +119,57 @@ def _read_session(p: Path) -> dict | None:
     return s
 
 
+def _record_abandon(s: dict, reason: str) -> None:
+    """Append one abandon row. Never raises - recording an abandon must never
+    be able to block the thing it is recording."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with (STATE_DIR / "abandons.jsonl").open("a") as fh:
+            fh.write(json.dumps({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "session_id": s["id"],
+                "completed": s["completed"],
+                "target": s["target"],
+                "dials": s["dials"],
+                "reason": reason,
+            }) + "\n")
+    except Exception as e:  # noqa: BLE001
+        print(f"[abandon not recorded] {e}", flush=True)
+
+
+def _has_live_work(s: dict) -> bool:
+    """Is there anything left in this session that still needs rescuing?
+
+    Only ever asked of a session that outlived its day. Deliberately
+    conservative - it answers yes for anything ambiguous, because wrongly
+    retiring a session loses an outcome, while wrongly resuming one only costs
+    a start screen.
+    """
+    if s.get("pending_outcome") or s.get("current_call"):
+        return True
+    # An outcome is mid-flight in both of these, with nothing parked yet.
+    if s.get("state") in ("DIALING", "TALLY"):
+        return True
+    now = time.time()
+    deadline = {"WARMUP": "warmup_until", "BREATHER": "breather_until",
+                "PAUSED": "pause_until"}.get(s.get("state"))
+    return bool(deadline and (s.get(deadline) or 0) > now)
+
+
 def load_session() -> dict | None:
     """The session to resume, if there is one.
 
-    Looks for today's file first, then falls back to the newest unfinished one.
-    Keying only on today's date orphaned any session that outlived local
-    midnight - the file kept yesterday's name, nothing ever looked for it
-    again, and a parked outcome inside it was never committed. That directly
-    contradicts the promise the whole design rests on: relaunching always drops
-    him back where he was, and no outcome is ever lost.
+    Today's file always resumes, unconditionally - quitting mid-session never
+    buys a fresh slate, and that is the promise the whole design rests on.
+
+    Yesterday's is different. That fallback exists so a session which outlived
+    local midnight is not orphaned with a parked outcome inside it that nothing
+    ever commits. But it used to fire for ANY unfinished yesterday file, so a
+    session quit at 2 of 5 the previous morning would hijack the next morning's
+    start screen - resuming into a breather that expired hours ago, which means
+    dialing on boot with no lock-in at all. That is the exact opposite of what
+    the warmup is for. So yesterday's file only comes back if it still has live
+    work in it; otherwise it is retired and recorded as the abandon it was.
     """
     p = session_path()
     if p.exists():
@@ -141,9 +183,23 @@ def load_session() -> dict | None:
     yesterday = session_path((date.today() - timedelta(days=1)).isoformat())
     if yesterday.exists():
         s = _read_session(yesterday)
-        if s:
+        if s and _has_live_work(s):
             print(f"resuming a session that outlived its day: {yesterday.name}", flush=True)
             return s
+        if s:
+            # Force-quit yesterday and left inert. The typed exit never ran, so
+            # this was never recorded - the start screen has been showing a
+            # clean history it had not earned. Mark it DONE on disk so the next
+            # boot reads it as finished and this cannot record twice.
+            _record_abandon(s, "stale")
+            s["abandoned"] = True
+            s["state"] = "DONE"
+            try:
+                yesterday.write_text(json.dumps(s, indent=2, default=str))
+            except OSError as e:
+                print(f"[stale session not retired on disk] {e}", flush=True)
+            print(f"retired a stale session from {s['date']}: {s['completed']} "
+                  f"of {s['target']}, recorded as abandoned", flush=True)
     return None
 
 
@@ -1041,19 +1097,8 @@ def abandon():
             _commit_pending()
         except Exception as e:  # noqa: BLE001
             print(f"[abandon: commit failed, leaving anyway] {e}", flush=True)
-        try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            with (STATE_DIR / "abandons.jsonl").open("a") as fh:
-                fh.write(json.dumps({
-                    "ts": datetime.now().isoformat(timespec="seconds"),
-                    "session_id": _session["id"],
-                    "completed": _session["completed"],
-                    "target": _session["target"],
-                    "dials": _session["dials"],
-                }) + "\n")
-        except Exception as e:  # noqa: BLE001
-            # Recording the abandon must never be able to block the abandon.
-            print(f"[abandon not recorded] {e}", flush=True)
+        # Recording the abandon must never be able to block the abandon.
+        _record_abandon(_session, "typed")
         _session["abandoned"] = True
         _session["state"] = "DONE"
         save_session()
