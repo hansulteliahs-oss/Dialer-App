@@ -45,7 +45,8 @@ load_env(ROOT / ".env")
 
 from dialer import outcomes                      # noqa: E402
 from dialer.airtable import (  # noqa: E402
-    DEFAULT_PILE, PILES, TIER_LABELS, AirtableClient, AirtableError, DialRefused,
+    DEFAULT_PILE, ICP_INDUSTRIES, PILES, TIER_LABELS, AirtableClient, AirtableError,
+    DialRefused,
 )
 from dialer.twilio_voice import TwilioConfigError, TwilioVoice  # noqa: E402
 
@@ -109,6 +110,32 @@ def save_session() -> None:
         print(f"[SESSION NOT SAVED - resume will be stale] {e}", flush=True)
 
 
+def _scrub_queue(s: dict) -> dict:
+    """Drop off-ICP leads a resumed session prefetched under an older narrow.
+
+    A session persists its whole queue - 80 leads - and resume is unconditional
+    by design, so a queue built before the trade narrow changed would otherwise
+    outlive the change and keep serving trades he no longer sells to. That is
+    not hypothetical: when the narrow went unconditional on 2026-08-17 the live
+    session was 5 dials in and holding 29 off-ICP rows in its remaining 75.
+
+    Only the UNDIALED tail is filtered. Everything before `cursor` already
+    happened and its outcomes are committed, so rewriting it would corrupt the
+    tally to no purpose - and leaving it keeps `cursor` valid without touching a
+    single counter. If the tail empties, the refill in `advance` rebuilds it
+    from Airtable under the current filter.
+    """
+    q = s.get("queue") or []
+    cur = s.get("cursor", 0)
+    tail = q[cur:]
+    kept = [l for l in tail if (l.get("industry") or "") in ICP_INDUSTRIES]
+    if len(kept) != len(tail):
+        s["queue"] = q[:cur] + kept
+        print(f"[queue scrubbed] dropped {len(tail) - len(kept)} off-ICP leads from "
+              f"a resumed session; {len(kept)} left undialed", flush=True)
+    return s
+
+
 def _read_session(p: Path) -> dict | None:
     try:
         s = json.loads(p.read_text())
@@ -116,7 +143,7 @@ def _read_session(p: Path) -> dict | None:
         return None
     if s.get("abandoned") or s.get("state") == "DONE":
         return None
-    return s
+    return _scrub_queue(s)
 
 
 def _record_abandon(s: dict, reason: str) -> None:

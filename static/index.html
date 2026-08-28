@@ -30,9 +30,15 @@
       <label class="ctl">
         <span>industry</span>
         <select id="industry">
-          <option value="">all trades</option>
+          <!-- "" = the default: all three ICP trades (see TRADE_NARROW in
+               dialer/airtable.py). Roofing/Remodelers are NOT pickable as of
+               2026-08-17 - the narrow is unconditional now, so picking one would
+               compose to an empty queue and report itself as "no dialable leads
+               match those filters", which reads as a bug rather than as the narrow
+               doing its job. The table still holds ~2.8k of those rows because
+               maps-lead-engine keeps sourcing them; they are just not dialable. -->
+          <option value="">all 3 trades</option>
           <option>HVAC</option><option>Plumbing</option><option>Electrical</option>
-          <option>Roofing</option><option>Remodelers</option>
         </select>
       </label>
       <label class="ctl">
@@ -47,7 +53,7 @@
     <p id="idle-status" class="idle-status"></p>
     <p class="fineprint">
       <b>SPACE</b> voicemail or dead end &middot; <b>ENTER</b> real conversation &middot;
-      <b>1</b>&ndash;<b>5</b> disposition &middot; <b>D</b> do-not-call &middot; <b>P</b> pause (one)
+      <b>1</b>&ndash;<b>5</b> disposition &middot; <b>G</b> gatekeeper &middot; <b>D</b> do-not-call &middot; <b>P</b> pause (one)
     </p>
   </div>
 </section>
@@ -135,7 +141,7 @@
         <textarea id="note" class="note" rows="3"
                   placeholder="note (optional) &mdash; typing holds the timer"></textarea>
         <div class="hint">
-          <b>ENTER</b> go now &middot; <b>1</b>&ndash;<b>5</b> change disposition &middot;
+          <b>ENTER</b> go now &middot; <b>1</b>&ndash;<b>5</b> change disposition &middot; <b>G</b> gatekeeper &middot;
           <b>D</b> do-not-call &middot; <b>P</b> pause
         </div>
       </div>

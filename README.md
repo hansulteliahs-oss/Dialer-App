@@ -303,6 +303,14 @@ made to a human is never buried, whichever pile you pick.
 
 The industry picker still narrows within whichever pile is selected.
 
+**Every pile and every tier is capped to the three ICP trades — HVAC, plumbing,
+electrical (2026-08-17).** The Call List holds ~2,800 roofing/remodeler rows
+because `maps-lead-engine` deliberately keeps sourcing them, and none of them can
+reach the dialer. There is no exemption and no opt-out flag: not for a
+mystery-shopped row, and not for a due callback. See `TRADE_NARROW` in
+`dialer/airtable.py` for why both of those carve-outs existed for one day and
+then died.
+
 ### Why `callback due` exists — the bug it fixes
 
 Every non-terminal disposition writes `Status = Snoozed` with a future

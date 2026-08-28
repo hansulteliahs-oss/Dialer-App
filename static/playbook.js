@@ -37,12 +37,16 @@ window.PLAYBOOK = {
     'Under 90 seconds if there is no friction.',
     'No voicemail on attempts 1 and 2. Brief one on attempt 3.',
     'No name? "Who’s the owner over there?" Never "may I speak to the owner."',
+    'Front desk: get the callback window every time. Press G, never 3.',
   ],
 
   // The live-call rail. Trigger phrase he will actually hear, then the angle.
   // Ordered by how often the playbook expects each one, commonest first, so his
   // eye learns fixed positions and stops reading the list as a list.
   rail: [
+    // First because it is not close: all 20 dials on 2026-08-13 ended here.
+    ['"he’s out on a job"', 'get the window. a fact, never a pitch. press G'],
+    ['"can I take a message?"', 'the form you never answered. not the one-liner'],
     ['"no time"', 'agree — that’s exactly when calls slip'],
     ['"not interested"', 'in what? you haven’t pitched. → "how many did you miss last week?"'],
     ['"wife / office mgr handles it"', 'include them, both on the call'],
@@ -58,6 +62,10 @@ window.PLAYBOOK = {
   // have said. Deliberately absent from the 15-second dead-end breather, where
   // it would be noise on a call that never connected.
   angles: [
+    // Added 2026-08-13. Not an objection — the most common outcome on the board,
+    // and the one he had no branch for. Two days of dials all ended here.
+    ['"He’s out on a job — can I take a message?"',
+     'A receptionist can relay a FACT. She cannot relay a pitch. "I help home service businesses stop losing jobs to missed calls" is a pitch — abstract, sounds like every vendor, gone by the time she reaches the truck. Ask for the window first, every time: when’s he usually easiest to catch, morning or afternoon? That is the thing she can actually give you — she can’t book a meeting and won’t sell one for you. Only if she offers to take a message, hand her one concrete fact: tell him I filled out the quote form on your site last week and never heard back, that’s the reason for the call. Then immediately — not calling to complain, that’s literally the thing I fix — because she may be the one who handles those forms. Close on a plan, never on a value statement: I’ll try back {window}, thanks {name}. Ending on what you do is a period she can’t act on, and that pause is where the call dies. Press G.'],
     ['"I don’t have time."',
      'Agree, then tie it to the leak. When you’re this slammed is exactly when calls slip — 30 minutes next week and I’ll show you which ones.'],
     ['"I’m not interested."',

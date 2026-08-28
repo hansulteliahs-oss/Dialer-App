@@ -140,6 +140,61 @@ PILES = {
 }
 DEFAULT_PILE = "priority"
 
+# --- the trade narrow (2026-08-16, made unconditional 2026-08-17) --------------
+# The ICP went from five trades to three: HVAC, plumbing, electrical. Roofers and
+# remodelers are out (remodelers run long sales cycles where the missed-call wedge
+# barely lands; roofing is storm-lumpy).
+#
+# The Call List does NOT reflect that and deliberately never will: maps-lead-engine
+# keeps sourcing all five because remodelers are its supply floor, and a cheap unsold
+# row costs nothing. So 43.6% of the table (2,548 of 5,850 rows) is off-ICP and the
+# narrow has to be enforced HERE, at the only place that spends his time.
+#
+# It applies to EVERY tier, with no exemptions (Eliahs, 2026-08-17). It shipped a day
+# earlier with two, and both were measured and killed:
+#
+#   - `Lead Type='Mystery Shopped'` used to be exempt at any tier, on the grounds that
+#     the shop was a real form against a real business and a ghosted roofer is the
+#     strongest opener in the playbook. But the shop is sunk whether or not he dials,
+#     and dialing does not recover it - it only spends the one thing the narrow exists
+#     to protect. Measured on the default `priority` pile: 35 exempt roofing/remodeler
+#     rows sat in the HOTTEST tiers, so they front-loaded to 19 of the first 60 leads.
+#     A third of his dial day was going to trades he had decided not to sell to.
+#   - `callback_due` used to be exempt, on the grounds that a promise to a human
+#     outranks a segmentation decision made afterwards. That principle is right and it
+#     simply did not apply: all 5 off-ICP rows in that tier were `Disposition='No
+#     Answer'` auto-snooze rollforwards. Nobody had promised him anything. The tier is
+#     keyed on the `Next Action` DATE, and every non-terminal disposition writes one,
+#     so "has a callback date" never meant "a human asked for a callback".
+#
+# If a real promise to an off-ICP shop ever does get made, honor it by hand. Do not
+# reinstate a blanket exemption - that is what put roofers back on top of the queue.
+ICP_INDUSTRIES = ("HVAC", "Plumbing", "Electrical")
+TRADE_NARROW = "OR(" + ", ".join(
+    "{Industry}='%s'" % i for i in ICP_INDUSTRIES) + ")"
+
+# Inside a tier, rows that carry an owner name go first.
+#
+# Calling a business with no human name to ask for is the hardest version of the
+# call - harder than the fear of the call itself - and it is not a rare case:
+# 3,067 of the 5,831 dialable rows have no First Name, so the old Date-Added-only
+# sort was handing him a coin flip on every dial. `Full Name` does NOT rescue it;
+# that column is a duplicate of `Company` on 99% of rows and never held a person.
+#
+# Ordering is the fix rather than a skip key. A skip key would be an escape hatch
+# over half the pile, reachable at exactly the moment the fear is loudest, and
+# "no key that ends a dial early" is the premise the whole app rests on.
+#
+# Unnamed rows still FOLLOW rather than being filtered out, for the same reason
+# `priority` falls through to `queued`: the queue must never run dry mid-session.
+# 2,764 named rows against a 40-dial day is ~69 days of runway, so in practice
+# the second pass is insurance, not a path he walks.
+#
+# This is a sub-tier, not a global re-sort. Tier order stays absolute - a due
+# callback still outranks a named cold row - and the name only breaks ties inside
+# a single tier. That keeps the promise-to-a-human guarantee above comfort.
+NAME_PASSES = ("{First Name}!=''", "{First Name}=''")
+
 
 def normalize_phone(raw: str | None) -> str | None:
     """Airtable phoneNumber -> strict E.164 +1XXXXXXXXXX, or None if unusable.
@@ -285,7 +340,11 @@ class AirtableClient:
 
     @staticmethod
     def _formula(tier_clause: str, industry: str | None) -> str:
-        clauses = [tier_clause, *BASE_EXCLUSIONS]
+        # The narrow is unconditional and has no opt-out parameter on purpose. It was
+        # a per-tier flag for one day and the flag is precisely how 19 of the first 60
+        # leads came back off-ICP. A filter that protects his dial time has to be the
+        # one thing a caller cannot forget to pass.
+        clauses = [tier_clause, *BASE_EXCLUSIONS, TRADE_NARROW]
         if industry:
             # Airtable escapes a quote inside a string literal by DOUBLING it.
             # Stripping it instead meant an Industry containing an apostrophe
@@ -331,42 +390,58 @@ class AirtableClient:
                 continue
             if len(out) >= limit:
                 break
-            for rec in self.fetch_tier(clause, limit - len(out), industry, timeout):
-                if rec["id"] in seen:
-                    continue
-                f = rec.get("fields", {}) or {}
-                # Belt and braces: the formula already excludes these, but a DNC
-                # row must never reach the UI even if a formula is edited badly.
-                if f.get("DNC"):
-                    continue
-                phone = normalize_phone(f.get("Phone"))
-                if not phone:
-                    continue
-                seen.add(rec["id"])
-                out.append({
-                    "id": rec["id"],
-                    "tier": tier_name,
-                    "tier_label": TIER_LABELS[tier_name],
-                    "company": f.get("Company") or "(no company)",
-                    "first_name": (f.get("First Name") or "").strip(),
-                    "full_name": (f.get("Full Name") or "").strip(),
-                    "industry": f.get("Industry") or "",
-                    "phone": phone,
-                    "phone_display": f.get("Phone") or phone,
-                    "website": f.get("Website") or "",
-                    "context_cue": f.get("Context Cue") or "",
-                    "leak_signal": f.get("Leak Signal") or "",
-                    "lead_type": f.get("Lead Type") or "",
-                    "shop_result": f.get("Shop Result") or "",
-                    "attempts": f.get("Attempts") or 0,
-                    "notes": f.get("Notes") or "",
-                    "next_action": f.get("Next Action") or "",
-                    "next_action_note": f.get("Next Action Note") or "",
-                    "status": f.get("Status") or "",
-                    "disposition": f.get("Disposition") or "",
-                })
+            # Named rows of THIS tier, then unnamed rows of this tier, then on to
+            # the next tier. Two cheap filtered reads beat one wide read plus a
+            # local sort: a tier can be 5,710 rows deep and only `limit` of them
+            # are ever wanted, so paging the whole tier back to sort it would
+            # trade a fear problem for a latency problem on the dial path.
+            for name_clause in NAME_PASSES:
                 if len(out) >= limit:
                     break
+                scoped = "AND(%s, %s)" % (clause, name_clause)
+                for rec in self.fetch_tier(scoped, limit - len(out), industry,
+                                           timeout):
+                    if rec["id"] in seen:
+                        continue
+                    f = rec.get("fields", {}) or {}
+                    # Belt and braces: the formula already excludes these, but a DNC
+                    # row must never reach the UI even if a formula is edited badly.
+                    if f.get("DNC"):
+                        continue
+                    # Same reasoning for the trade narrow. This is the check that is
+                    # true independent of whether TRADE_NARROW composed correctly into
+                    # the server-side formula, and it is the one that actually holds
+                    # the guarantee "he never dials a trade he does not sell to".
+                    if (f.get("Industry") or "") not in ICP_INDUSTRIES:
+                        continue
+                    phone = normalize_phone(f.get("Phone"))
+                    if not phone:
+                        continue
+                    seen.add(rec["id"])
+                    out.append({
+                        "id": rec["id"],
+                        "tier": tier_name,
+                        "tier_label": TIER_LABELS[tier_name],
+                        "company": f.get("Company") or "(no company)",
+                        "first_name": (f.get("First Name") or "").strip(),
+                        "full_name": (f.get("Full Name") or "").strip(),
+                        "industry": f.get("Industry") or "",
+                        "phone": phone,
+                        "phone_display": f.get("Phone") or phone,
+                        "website": f.get("Website") or "",
+                        "context_cue": f.get("Context Cue") or "",
+                        "leak_signal": f.get("Leak Signal") or "",
+                        "lead_type": f.get("Lead Type") or "",
+                        "shop_result": f.get("Shop Result") or "",
+                        "attempts": f.get("Attempts") or 0,
+                        "notes": f.get("Notes") or "",
+                        "next_action": f.get("Next Action") or "",
+                        "next_action_note": f.get("Next Action Note") or "",
+                        "status": f.get("Status") or "",
+                        "disposition": f.get("Disposition") or "",
+                    })
+                    if len(out) >= limit:
+                        break
         return out
 
     def get_record(self, record_id: str, timeout: int = 30) -> dict:

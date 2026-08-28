@@ -30,6 +30,7 @@ from datetime import date, datetime, timedelta
 # schema before. Note "Busy, Call Back" is ONE option whose name contains a comma.
 LIVE_DISPOSITIONS = (
     "No Answer",
+    "Gatekeeper blocked",
     "Busy, Call Back",
     "Not interested",
     "Conversation",
@@ -43,8 +44,21 @@ PROMISE_DISPOSITIONS = {"Busy, Call Back", "Conversation"}
 TERMINAL_DISPOSITIONS = {"Not interested"}
 BOOKED = "Meeting Booked"
 
+# Reached a human, but not the one who can buy. Added 2026-08-13 after two days
+# of dials where every receptionist was logged as "Conversation" - 32 dials, 8
+# rows reading as real conversations, zero of them the owner. That inflation fed
+# tune_me_out_gate.count_today, whose CONVO_DISPOSITIONS is
+# {"Conversation", "Meeting Booked", "Not interested"}: two receptionists
+# satisfied the "2 real conversations" unlock. Splitting the option out is the
+# whole fix - the gate needs no change, it just stops being lied to.
+GATEKEEPER = "Gatekeeper blocked"
+
 # Nobody promised anything but the row is not finished. Matches the CLI.
-RETRY_DEFAULT_DAYS = {"No Answer": 2}
+#
+# Gatekeeper is +1d, not the +2d of a no-answer: the playbook's instruction is to
+# try again at a different time of day, and BASE_EXCLUSIONS already forbids the
+# same row twice in one day, so tomorrow is the soonest a retry can happen.
+RETRY_DEFAULT_DAYS = {"No Answer": 2, GATEKEEPER: 1}
 # The divergence: pre-filled instead of refused. Editable during the breather.
 PREFILL_DAYS = {"Busy, Call Back": 3, "Conversation": 7}
 
@@ -55,22 +69,45 @@ RETIREMENT_NOTE = "retired - no contact in 4 attempts"
 # Keyboard -> disposition. Ordered by escalating engagement (didn't reach them ->
 # reached them -> done with them), not by the schema's arbitrary option order.
 # The selftest asserts every live option is reachable by exactly one key.
+#
+# Gatekeeper breaks that ordering on purpose: by engagement it belongs at 2, but
+# renumbering 2-5 mid-sprint would retrain four keys he has been hitting for days
+# and the cost of a mis-keyed disposition is a wrong row in the one dataset the
+# accountability stack reads. A letter costs nothing and is the most-pressed key
+# on the board - 20 of 20 dials on 2026-08-13 ended at a front desk. The window
+# builds its key map from this dict (/api/config -> S.cfg.dispositions), so
+# adding it here is all the UI needs; only the fineprint in index.html is
+# hard-coded text.
 KEY_TO_DISPOSITION = {
     "1": "No Answer",
+    "g": GATEKEEPER,
     "2": "Busy, Call Back",
     "3": "Conversation",
     "4": "Not interested",
     "5": "Meeting Booked",
 }
 
+# Outcomes that always leave a dated "[date] <Disposition> - ..." line in Notes,
+# whether or not he typed anything. This is the durable record that a human
+# picked up, and it is what the attempt cap reads years later.
+#
+# Gatekeeper is in here for the cap, NOT because it is a real conversation - it
+# is deliberately absent from tune_me_out_gate's CONVO_DISPOSITIONS. A front desk
+# that answers proves the number is live and someone is there, which is the exact
+# opposite of the four-dead-dials case the cap exists to close.
+MARKED_DISPOSITIONS = PROMISE_DISPOSITIONS | {BOOKED, GATEKEEPER}
+
 # A row that ever had real human contact must never be closed by the attempt cap.
 # There is no "ever talked" field and the plan forbids adding one, so the durable
-# signal is the Notes history: every promise-class outcome this dialer writes
-# leaves a "[date] <Disposition> - ..." line behind. Rows last touched by the CLI
-# only carry a marker if a note was passed, so cap-retirement also checks the
-# row's current Disposition as a second, shallower signal.
+# signal is the Notes history above. Rows last touched by the CLI only carry a
+# marker if a note was passed, so cap-retirement also checks the row's current
+# Disposition as a second, shallower signal.
+#
+# Built from MARKED_DISPOSITIONS rather than hand-written so the two can never
+# drift - a new marked outcome is protected from the cap the moment it is added.
 _REAL_CONTACT_RE = re.compile(
-    r"\[\d{4}-\d{2}-\d{2}\]\s*(Conversation|Busy, Call Back|Meeting Booked)\b"
+    r"\[\d{4}-\d{2}-\d{2}\]\s*(" +
+    "|".join(re.escape(d) for d in sorted(MARKED_DISPOSITIONS)) + r")\b"
 )
 
 
@@ -134,8 +171,7 @@ def had_real_contact(fields: dict) -> bool:
     """True if this row ever reached a human, so the attempt cap must not close it."""
     if _REAL_CONTACT_RE.search(fields.get("Notes") or ""):
         return True
-    prior = fields.get("Disposition")
-    return prior in PROMISE_DISPOSITIONS or prior == BOOKED
+    return fields.get("Disposition") in MARKED_DISPOSITIONS
 
 
 def should_retire(fields: dict, disposition: str, new_attempts: int) -> bool:
@@ -182,13 +218,13 @@ def build_payload(
 
     note_lines: list[str] = []
     if note and note.strip():
-        # Promise-class outcomes get the disposition stamped into the line so
+        # Marked outcomes get the disposition stamped into the line so
         # had_real_contact() can find it years later.
-        if disposition in PROMISE_DISPOSITIONS or disposition == BOOKED:
+        if disposition in MARKED_DISPOSITIONS:
             note_lines.append(f"[{today}] {disposition} - {note.strip()}")
         else:
             note_lines.append(f"[{today}] {note.strip()}")
-    elif disposition in PROMISE_DISPOSITIONS or disposition == BOOKED:
+    elif disposition in MARKED_DISPOSITIONS:
         # No typed note, but this row reached a human. Leave the marker anyway.
         note_lines.append(f"[{today}] {disposition}")
 
@@ -261,6 +297,36 @@ def _selftest() -> int:
     # 3 attempts is not yet the cap
     p = build_payload({"fields": {"Attempts": 2}}, "No Answer")
     check("attempt 3 not retired", p["Status"], "Snoozed")
+
+    # --- gatekeeper (added 2026-08-13) ---------------------------------------
+    # retry-class, +1d not +2d: the playbook says try a different time of day and
+    # BASE_EXCLUSIONS forbids the same row twice in one day, so tomorrow is the
+    # soonest possible retry.
+    check("gatekeeper default", plan_followup(GATEKEEPER, None), ("Snoozed", plus(1)))
+    # it is human contact, so it must never be silently terminal
+    if GATEKEEPER in TERMINAL_DISPOSITIONS or GATEKEEPER in PROMISE_DISPOSITIONS:
+        fails.append("gatekeeper must be retry-class - neither terminal nor a promise")
+    # ...and it must leave a findable marker even with no typed note, or the cap
+    # will close a row where somebody actually picks up the phone
+    p = build_payload({"fields": {"Attempts": 0}}, GATEKEEPER)
+    if not _REAL_CONTACT_RE.search(p.get("Notes", "")):
+        fails.append(f"gatekeeper left no real-contact marker: {p.get('Notes')!r}")
+    check("gatekeeper attempts", p["Attempts"], 1)
+    # three front desks then a dead dial is not four dead dials
+    gk = {"fields": {"Attempts": 3, "Notes": "[2026-08-13] Gatekeeper blocked - tom out on a job"}}
+    p = build_payload(gk, "No Answer")
+    check("gatekeeper survives cap", p["Status"], "Snoozed")
+    if RETIREMENT_NOTE in p.get("Notes", ""):
+        fails.append("a row with a live front desk was retired by the cap")
+    # the shallower prior-disposition signal too
+    check("prior gatekeeper survives cap",
+          build_payload({"fields": {"Attempts": 3, "Disposition": GATEKEEPER}}, "No Answer")["Status"],
+          "Snoozed")
+    check("gatekeeper key", KEY_TO_DISPOSITION.get("g"), GATEKEEPER)
+    # the numbered keys must not have shifted - he has been hitting them for days
+    check("keys 1-5 unchanged",
+          [KEY_TO_DISPOSITION[k] for k in "12345"],
+          ["No Answer", "Busy, Call Back", "Conversation", "Not interested", "Meeting Booked"])
 
     # a row that reached a human is never closed by the cap
     talked = {"fields": {"Attempts": 3, "Notes": "[2026-07-01] Conversation - wants a call back"}}

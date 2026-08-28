@@ -103,7 +103,7 @@ def main() -> int:
     else:
         want = literals(CLI, {"LIVE_DISPOSITIONS", "PROMISE_DISPOSITIONS",
                               "TERMINAL_DISPOSITIONS", "RETRY_DEFAULT_DAYS"})
-        check("the five live Disposition options match",
+        check("the live Disposition options match",
               set(outcomes.LIVE_DISPOSITIONS), set(want["LIVE_DISPOSITIONS"]))
         check("promise dispositions match",
               outcomes.PROMISE_DISPOSITIONS, want["PROMISE_DISPOSITIONS"])
